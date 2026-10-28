@@ -19,7 +19,8 @@ It runs in two modes on two separate Alpaca **paper** accounts:
 
 Success for Stage 1: both modes run a full session against Alpaca paper accounts,
 follow the rules below exactly, and every signal/skip/trade is in the journal so
-`/report` can show how the rule performs.
+`/report` can show how the rule performs; and `daytrader backtest` replays the same
+rules over past days (Feb 2024 onward) to estimate performance before paper trading.
 
 Inspired by Jake Schincariol's open-source `day-trader-skill` (feature reference
 only — no code reused).
@@ -131,6 +132,40 @@ approves the entry. This keeps the bot's track record a valid test of what Rabin
 - **Live-money trading is out of scope for Stage 1.** Approval mode is paper-only
   too; enabling live is a later, deliberate change.
 
+### 3.4 Backtest (`daytrader backtest`)
+Runs the exact Stage 1 rules over past trading days to estimate how they would
+have performed, in minutes instead of months of paper trading.
+
+- **Period:** any range from **February 2024** onward (Alpaca's historical option
+  data starts then). Default: the last 12 months.
+- **Stock data:** 5-min bars from Alpaca's full-market (SIP) feed, which the free
+  plan allows for data older than 15 minutes. (Live trading uses IEX, so VWAP may
+  differ slightly between backtest and live — noted in every report.)
+- **Same logic:** reuses `orb`, `sizing`, `exits` and `guard` unchanged, with the same
+  entry window, one-position rule and daily guard.
+- **Contract choice:** at a signal, fetch historical bars for the nearest-after-today
+  expiry's strikes near the money; compute each strike's delta with Black-Scholes
+  from implied volatility backed out of its price (risk-free rate from config,
+  default 4%, dividends ignored); pick |delta| 0.60–0.70 closest to 0.65 with
+  price ≤ $5.00. Open interest and live spread can't be checked historically —
+  instead the contract needs at least one trade in the signal bar, and fills are
+  charged an assumed spread (below).
+- **Fills (conservative):** entry at the option's price at the signal + half an
+  assumed spread (default 3% of price); exits at the trigger price − half the
+  assumed spread. Exits checked on 1-min option bars (+20% / −10% by bar
+  high/low) and stock bars (midpoint / 1R). If a stop and a target are both hit
+  inside one bar, assume the **stop** hit first.
+- **Missing data:** if no option bars exist for the contract, the signal is
+  counted as "no data" and skipped — never invented.
+- **Cache:** downloaded bars are cached locally so re-runs are fast; first run for
+  12 months × the ticker list may take a while within the 200 calls/min limit.
+- **Output:** writes to `state/journal-backtest.db` (same schema as the live
+  journals) so `/report` works on it, plus a summary: trades, win rate, avg
+  win/loss, total P&L, worst day, longest losing streak, P&L by ticker and by
+  month, which checks blocked signals, and the count of "no data" skips.
+- **Caveat printed on every report:** past results don't predict future results;
+  assumed spreads and bar-level fills are approximations.
+
 ## 4. Architecture
 
 One Python package (`daytrader`) holds all logic once; Claude Code skills are thin
@@ -150,7 +185,9 @@ front-ends that call its CLI.
 | `exits` | Position + latest prices → exit reason or hold — pure function | — |
 | `journal` | SQLite (`state/journal-<mode>.db`): signals, skips, tickets, orders, trades, days | sqlite3 |
 | `session` | The day loop for either mode; uses an `Approver` (auto for bot, file-based for approval) | all above |
-| `cli` | `run`, `scan`, `approve`, `reject`, `status`, `report`, `doctor`, `record` | session |
+| `pricing` | Black-Scholes price, delta, implied-vol solver — pure functions | — |
+| `backtest` | Replays past days through `orb`/`sizing`/`exits`/`guard` with historical bars, simulated fills, local cache | data, pricing, journal |
+| `cli` | `run`, `scan`, `approve`, `reject`, `status`, `report`, `backtest`, `doctor`, `record` | session, backtest |
 
 Pure functions (`indicators`, `orb`, `contracts`, `sizing`, `exits`) hold all
 trading decisions and never touch the network, so they can be tested exhaustively.
@@ -159,8 +196,9 @@ trading decisions and never touch the network, so they can be tested exhaustivel
 - `/trade-session` — start approval mode, relay tickets, take yes/no, summarize the day.
 - `/scan` — one-off: affordability filter + current state of each ticker's checks.
 - `/bot-status` — is the bot running (heartbeat), open position, today's P&L, guard state.
-- `/report` — performance from either journal: win rate, avg win/loss, P&L by day and
-  ticker, which checks blocked signals most, skip reasons.
+- `/report` — performance from any journal (bot, approval, backtest): win rate, avg
+  win/loss, P&L by day and ticker, which checks blocked signals most, skip reasons.
+- `/backtest` — run a backtest over a chosen period and explain the results.
 
 ## 5. Daily flow (both modes)
 
@@ -202,6 +240,11 @@ trading decisions and never touch the network, so they can be tested exhaustivel
 - **Session tests:** full simulated days with `FakeBroker`, fake data and a fake
   clock — signal → order → each exit type → guard trips → no more entries; approval
   ticket accept / reject / expire / re-quote; crash-reconcile.
+- **Pricing:** Black-Scholes price/delta against published reference values;
+  implied-vol solver round-trips (price → IV → price).
+- **Backtest:** fixture days with known outcomes (target hit, stop hit, both in one
+  bar → stop, time exit, guard trips, missing option data → skipped), and a check
+  that live session and backtest produce the same signals on the same bars.
 - **Recorded data:** `daytrader record` saves a real day's Alpaca bars and chains to
   fixtures so real sessions can be replayed as tests.
 - **Smoke test:** `daytrader doctor` on Rabin's computer checks keys, paper
@@ -217,7 +260,8 @@ trading decisions and never touch the network, so they can be tested exhaustivel
 
 ## 9. Out of scope (later stages)
 
-- Stage 2: Time Machine / backtesting (option P&L via a pricing model), deeper risk tooling.
+- Stage 2: Time Machine (per-ticket odds from thousands of simulated sessions),
+  deeper risk tooling.
 - Stage 3: news monitor, earnings analyst.
 - Stage 4: price alerts, Pelosi tracker.
 - Live-money trading, phone notifications, more setups beyond ORB.
