@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "daytrader",
+  "description": "Opening-range-breakout options day-trading skills for Claude Code (paper trading only).",
+  "owner": {"name": "Rabin Regmi"},
+  "plugins": [
+    {
+      "name": "daytrader",
+      "description": "Opening-range-breakout options day trading on Alpaca paper accounts: approval-mode trade sessions, scans, status, reports and backtests.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
