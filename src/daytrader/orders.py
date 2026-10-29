@@ -6,10 +6,15 @@ Alpaca cancels are asynchronous and status reads can fail, so an order is only
 terminal, its final status is held until the caller `collect`s it, so no fill is
 ever discarded. `execute` refuses to place an order while anything is unsettled
 or uncollected.
+
+Every order carries a fresh client order id. If submitting raises (e.g. the response
+was lost), the order is looked up by that id: found -> tracked as unsettled like any
+live order; not found -> treated as not placed.
 """
 from __future__ import annotations
 
 import traceback
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Callable, Literal
@@ -20,6 +25,7 @@ from .clock import Clock
 TERMINAL = ("filled", "canceled", "rejected")
 POLL_EVERY = timedelta(seconds=2)
 CANCEL_WAIT = timedelta(seconds=20)
+LOOKUP_TRIES = 3
 
 Side = Literal["buy", "sell"]
 
@@ -71,16 +77,21 @@ class Orders:
         return out
 
     def execute(
-        self, place: Callable[[], str], symbol: str, side: Side, qty: int, timeout: timedelta
+        self, place: Callable[[str], str], symbol: str, side: Side, qty: int, timeout: timedelta
     ) -> Fill:
-        """Place an order, wait up to `timeout` for a full fill, else cancel and settle it."""
+        """Place an order (place(client_order_id) -> order id), wait up to `timeout` for a
+        full fill, else cancel and settle it. A not-placed order is Fill("", 0, None, True)."""
         self.refresh()
         if self.unsettled or self._settled:
             raise UnsettledOrderError(
                 f"not placing a {symbol} order: unsettled {sorted(self.unsettled)}, "
                 f"uncollected {[s.order_id for s in self._settled]}"
             )
-        oid = place()
+        cid = uuid.uuid4().hex
+        try:
+            oid = place(cid)
+        except Exception as exc:
+            return self._lost_submit(cid, exc, symbol, side)
         st: OrderStatus | None = None
         try:
             st = self._poll(oid, qty, timeout)
@@ -104,6 +115,26 @@ class Orders:
         self._event("warn", f"order {oid} ({side} {symbol}) unsettled; no new orders until it "
                             f"settles: {why}")
         return Fill(oid, st.filled_qty if st else 0, st.avg_price if st else None, False)
+
+    def _lost_submit(self, cid: str, exc: Exception, symbol: str, side: Side) -> Fill:
+        for attempt in range(LOOKUP_TRIES):
+            try:
+                found = self.broker.order_by_client_id(cid)
+                break
+            except Exception:
+                if attempt == LOOKUP_TRIES - 1:
+                    self._event("error", f"{side} {symbol} submit failed ({exc!r}) and the "
+                                         f"lookup of client id {cid} failed too")
+                    raise exc
+                self.clock.sleep_until(self.clock.now() + POLL_EVERY)
+        if found is None:
+            self._event("warn", f"{side} {symbol} order not placed: {exc!r}")
+            return Fill("", 0, None, True)
+        oid = found[0]
+        self.unsettled[oid] = (symbol, side)
+        self._event("warn", f"order {oid} ({side} {symbol}) submit raised ({exc!r}) but the "
+                            "order exists; unsettled, no new orders until it settles")
+        return Fill(oid, 0, None, False)
 
     def _poll(self, oid: str, qty: int | None, timeout: timedelta) -> OrderStatus:
         """Poll until terminal (or `qty` filled) or timeout; return the last status read."""

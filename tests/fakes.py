@@ -1,6 +1,7 @@
 """Shared test doubles. Later tasks extend this module (FakeBroker, FakeHistorical)."""
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Sequence
 
@@ -63,6 +64,8 @@ class FakeBroker:
     Cancels are asynchronous like Alpaca's: with cancel_delay_reads = N the order still
     reports "new" for N status reads after cancel, then becomes "canceled" (or "filled"
     when fill_during_cancel). status_fails makes order_status raise.
+    place_raises = "before" | "after" makes the next submits raise before/after the order
+    reaches the broker; lookup_fails = N makes the next N order_by_client_id calls raise.
     """
 
     def __init__(self, fill_policy: str = "fill", market_fill_policy: str | None = None) -> None:
@@ -72,6 +75,11 @@ class FakeBroker:
         self.cancel_delay_reads = 0
         self.fill_during_cancel = False  # the rest of the order fills while the cancel is pending
         self.status_fails = False
+        self.place_raises: str | None = None
+        self.lookup_fails = 0
+        self.cid_lookups: list[str] = []
+        self.cids: dict[str, str] = {}  # order id -> client order id
+        self.cancel_all_calls = 0
         self.cancels: list[str] = []
         self.orders: list[dict] = []
         self.market_price: dict[str, float] = {}
@@ -85,8 +93,12 @@ class FakeBroker:
         else:
             self._positions.pop(symbol, None)
 
-    def _place(self, side: str, symbol: str, qty: int, limit: float | None, type_: str) -> str:
+    def _place(self, side: str, symbol: str, qty: int, limit: float | None, type_: str,
+               cid: str | None) -> str:
+        if self.place_raises == "before":
+            raise RuntimeError("submit failed")
         oid = f"o{len(self.orders) + 1}"
+        self.cids[oid] = cid or uuid.uuid4().hex
         self.orders.append(
             {"side": side, "symbol": symbol, "qty": qty, "limit": limit, "type": type_}
         )
@@ -107,16 +119,37 @@ class FakeBroker:
         }
         if filled:
             self._move(side, symbol, filled)
+        if self.place_raises == "after":
+            raise RuntimeError("submit response lost")
         return oid
 
-    def buy_limit(self, symbol: str, qty: int, limit: float) -> str:
-        return self._place("buy", symbol, qty, limit, "limit")
+    def buy_limit(self, symbol: str, qty: int, limit: float, client_order_id=None) -> str:
+        return self._place("buy", symbol, qty, limit, "limit", client_order_id)
 
-    def sell_limit(self, symbol: str, qty: int, limit: float) -> str:
-        return self._place("sell", symbol, qty, limit, "limit")
+    def sell_limit(self, symbol: str, qty: int, limit: float, client_order_id=None) -> str:
+        return self._place("sell", symbol, qty, limit, "limit", client_order_id)
 
-    def sell_market(self, symbol: str, qty: int) -> str:
-        return self._place("sell", symbol, qty, None, "market")
+    def sell_market(self, symbol: str, qty: int, client_order_id=None) -> str:
+        return self._place("sell", symbol, qty, None, "market", client_order_id)
+
+    def order_by_client_id(self, client_order_id: str):
+        self.cid_lookups.append(client_order_id)
+        if self.lookup_fails > 0:
+            self.lookup_fails -= 1
+            raise RuntimeError("lookup failed")
+        for oid, cid in self.cids.items():
+            if cid == client_order_id:
+                return oid, self.order_status(oid)
+        return None
+
+    def open_orders(self) -> list[str]:
+        return [oid for oid in self._state if self.order_status(oid).status in ("new", "partially_filled")]
+
+    def cancel_all_open(self) -> None:
+        self.cancel_all_calls += 1
+        for oid, st in self._state.items():
+            if st["status"] in ("new", "partially_filled"):
+                self.cancel(oid)
 
     def force_fill(self, order_id: str) -> None:
         """The rest of a live order fills now (e.g. while its cancel is still pending)."""

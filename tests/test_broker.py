@@ -1,3 +1,4 @@
+import re
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, patch
 
@@ -79,6 +80,42 @@ def test_order_requests():
     r = b._client.submit_order.call_args[0][0]
     assert (r.symbol, r.qty, r.side, r.time_in_force) == ("X", 2, OrderSide.SELL, TimeInForce.DAY)
     assert not hasattr(r, "limit_price")
+    cids = [c[0][0].client_order_id for c in b._client.submit_order.call_args_list]
+    assert all(re.fullmatch(r"[0-9a-f]{32}", c) for c in cids) and len(set(cids)) == 3
+    b.buy_limit("X", 1, 1.0, client_order_id="mine")
+    assert b._client.submit_order.call_args[0][0].client_order_id == "mine"
+
+
+def _api_error(code):
+    return APIError('{"message": "x"}', http_error=NS(response=NS(status_code=code)))
+
+
+def test_order_by_client_id():
+    from alpaca.trading.enums import OrderStatus as SdkStatus
+
+    b, _ = make_broker_mocked()
+    b._client = MagicMock()
+    b._client.get_order_by_client_id.return_value = NS(
+        id="oid1", status=SdkStatus.PARTIALLY_FILLED, filled_qty="1", filled_avg_price="2.5")
+    assert b.order_by_client_id("c1") == ("oid1", OrderStatus("partially_filled", 1, 2.5))
+    b._client.get_order_by_client_id.assert_called_once_with("c1")
+    b._client.get_order_by_client_id.side_effect = _api_error(404)
+    assert b.order_by_client_id("c2") is None
+    b._client.get_order_by_client_id.side_effect = _api_error(500)
+    with pytest.raises(APIError):
+        b.order_by_client_id("c3")
+
+
+def test_open_orders_and_cancel_all():
+    from alpaca.trading.enums import QueryOrderStatus
+
+    b, _ = make_broker_mocked()
+    b._client = MagicMock()
+    b._client.get_orders.return_value = [NS(id="a"), NS(id="b")]
+    assert b.open_orders() == ["a", "b"]
+    assert b._client.get_orders.call_args[0][0].status == QueryOrderStatus.OPEN
+    b.cancel_all_open()
+    b._client.cancel_orders.assert_called_once_with()
 
 
 def test_submit_not_retried():

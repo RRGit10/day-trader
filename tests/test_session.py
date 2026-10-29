@@ -350,11 +350,81 @@ def test_restart_resumes_open_position(env):
 def test_reconcile_missing_broker_position(env):
     env.add("AAA")
     _journal_position(env)
-    env.broker._positions["ZZZC"] = 3  # broker-only: warn, never managed
+    env.broker._positions["ZZZC"] = 3  # broker-only: warn, not managed, flattened at 15:55
     env.session.startup()
     assert env.session.position is None
     assert env.trade_rows() == [("AAA", 2, 2.50, 2.50, 0.0, "reconciled_missing")]
     assert any("ZZZC" in m for _, m in env.events("warn"))
+    assert env.session.orphans.held == {"ZZZC": 3}
+
+
+def test_unknown_broker_position_sold_at_market_at_flat_time(tmp_path):
+    e = Env(tmp_path, start=at(9, 0))
+    e.add("AAA")
+    e.data.chains[("AAA", "call")] = [quote("AAA", "call", 5.40, 5.60)]  # no trades today
+    e.data.chains[("AAA", "put")] = [quote("AAA", "put", 5.40, 5.60)]
+    e.broker._positions["ZZZC"] = 3
+    e.broker.market_price["ZZZC"] = 1.25
+    e.session.run_day()
+    assert e.broker.positions() == {}
+    (sell,) = _sells(e)
+    assert (sell["symbol"], sell["qty"], sell["type"]) == ("ZZZC", 3, "market")
+    flat = [m for _, m in e.events("info") if m.startswith("orphan_flatten")]
+    assert flat == ["orphan_flatten ZZZC x3 @ 1.25"]
+    assert e.trade_rows() == []
+    e.journal.close()
+
+
+def test_orphan_sell_unsettled_is_booked_when_it_settles(tmp_path):
+    e = Env(tmp_path, start=at(15, 50))
+    e.add("AAA")
+    e.broker._positions["ZZZC"] = 2
+    e.broker.market_price["ZZZC"] = 0.80
+    e.broker.market_fill_policy = "never"
+    e.broker.cancel_delay_reads = 10_000
+    real_status = e.broker.order_status
+
+    def status(oid):  # the stuck market sell fills at 15:58
+        if e.clock.now() >= at(15, 58) and e.broker._state[oid]["status"] == "new":
+            e.broker.force_fill(oid)
+        return real_status(oid)
+
+    e.broker.order_status = status
+    e.session.run_day()
+    assert e.broker.positions() == {}
+    assert len(_sells(e)) == 1
+    flat = [m for _, m in e.events("info") if m.startswith("orphan_flatten")]
+    assert flat == ["orphan_flatten ZZZC x2 @ 0.80"]
+    e.journal.close()
+
+
+def test_startup_cancels_open_orders_before_reconciling(env):
+    env.add("AAA")
+    env.broker.fill_policy = "never"
+    env.broker.buy_limit("AAAC", 2, 2.50)  # left open by yesterday's crashed run
+    env.broker.fill_policy = "fill"
+    env.broker.cancel_delay_reads = 2  # async cancel: still open for two reads
+    env.session.startup()
+    assert env.broker.open_orders() == []
+    assert env.broker.cancel_all_calls == 1
+    assert any("open order" in m for _, m in env.events("warn"))
+
+
+def test_entry_submit_error_with_order_at_broker_is_tracked(env):
+    env.broker.place_raises = "after"  # buy reaches Alpaca, response lost
+    pos = _enter_aaa(env)
+    assert pos.qty == 2 and env.trade_rows()[0][1] == 2
+    assert len(env.broker.orders) == 1
+
+
+def test_entry_submit_error_without_order_skips(env):
+    env.broker.place_raises = "before"
+    env.add("AAA")
+    env.open_day()
+    env.session.on_bar_close(at(9, 55))
+    assert env.session.position is None
+    assert ("AAA", "not_filled") in env.skips()
+    assert not env.session.no_new_entries
 
 
 def test_exception_stops_new_entries_but_manages_exits(tmp_path, monkeypatch):
@@ -645,8 +715,8 @@ def test_exit_reprices_then_goes_market(env):
     next_bids = iter([1.06, 1.04])
     real_sell_limit = env.broker.sell_limit
 
-    def sell_limit(symbol, qty, limit):  # the bid drops after each limit attempt
-        oid = real_sell_limit(symbol, qty, limit)
+    def sell_limit(symbol, qty, limit, client_order_id=None):  # bid drops after each attempt
+        oid = real_sell_limit(symbol, qty, limit, client_order_id)
         bid = next(next_bids, None)
         if bid is not None:
             env.data.set_quote("AAAC", bid, bid + 0.02)

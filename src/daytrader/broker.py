@@ -1,12 +1,14 @@
 """Broker port and Alpaca adapter. Always paper: there is no live-trading path."""
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Protocol
 
+from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest
 
 from .config import ConfigError, Keys
 from .data import with_retries
@@ -24,15 +26,25 @@ class OrderStatus:
 
 
 class Broker(Protocol):
-    def buy_limit(self, symbol: str, qty: int, limit: float) -> str: ...
+    """Every submit carries a client order id (a fresh uuid4 hex if none is given)."""
 
-    def sell_limit(self, symbol: str, qty: int, limit: float) -> str: ...
+    def buy_limit(self, symbol: str, qty: int, limit: float,
+                  client_order_id: str | None = None) -> str: ...
 
-    def sell_market(self, symbol: str, qty: int) -> str: ...
+    def sell_limit(self, symbol: str, qty: int, limit: float,
+                   client_order_id: str | None = None) -> str: ...
+
+    def sell_market(self, symbol: str, qty: int, client_order_id: str | None = None) -> str: ...
 
     def cancel(self, order_id: str) -> None: ...
 
     def order_status(self, order_id: str) -> OrderStatus: ...
+
+    def order_by_client_id(self, client_order_id: str) -> tuple[str, OrderStatus] | None: ...
+
+    def open_orders(self) -> list[str]: ...
+
+    def cancel_all_open(self) -> None: ...
 
     def positions(self) -> dict[str, int]: ...
 
@@ -45,6 +57,18 @@ _STATUS_MAP = {
     "replaced": "canceled",
     "rejected": "rejected", "suspended": "rejected", "stopped": "rejected",
 }
+
+
+def _to_status(o) -> OrderStatus:
+    raw = getattr(o.status, "value", o.status)
+    # Transitional states (pending_cancel, pending_replace, ...) are still live: "new".
+    status = _STATUS_MAP.get(str(raw), "new")
+    price = o.filled_avg_price
+    return OrderStatus(
+        status,
+        int(float(o.filled_qty or 0)),
+        float(price) if price is not None else None,
+    )
 
 
 class AlpacaBroker:
@@ -64,23 +88,27 @@ class AlpacaBroker:
         return with_retries(lambda: self._client.get_account())
 
     # Submissions are deliberately not retried: a retried submit could double-order.
-    def buy_limit(self, symbol: str, qty: int, limit: float) -> str:
+    # A submit whose response is lost is found again by its client order id (orders.py).
+    def buy_limit(self, symbol: str, qty: int, limit: float,
+                  client_order_id: str | None = None) -> str:
         req = LimitOrderRequest(
-            symbol=symbol, qty=qty, side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY, limit_price=limit,
+            symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+            limit_price=limit, client_order_id=client_order_id or uuid.uuid4().hex,
         )
         return str(self._client.submit_order(req).id)
 
-    def sell_limit(self, symbol: str, qty: int, limit: float) -> str:
+    def sell_limit(self, symbol: str, qty: int, limit: float,
+                   client_order_id: str | None = None) -> str:
         req = LimitOrderRequest(
-            symbol=symbol, qty=qty, side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY, limit_price=limit,
+            symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+            limit_price=limit, client_order_id=client_order_id or uuid.uuid4().hex,
         )
         return str(self._client.submit_order(req).id)
 
-    def sell_market(self, symbol: str, qty: int) -> str:
+    def sell_market(self, symbol: str, qty: int, client_order_id: str | None = None) -> str:
         req = MarketOrderRequest(
             symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+            client_order_id=client_order_id or uuid.uuid4().hex,
         )
         return str(self._client.submit_order(req).id)
 
@@ -88,16 +116,24 @@ class AlpacaBroker:
         with_retries(lambda: self._client.cancel_order_by_id(order_id))
 
     def order_status(self, order_id: str) -> OrderStatus:
-        o = with_retries(lambda: self._client.get_order_by_id(order_id))
-        raw = getattr(o.status, "value", o.status)
-        # Transitional states (pending_cancel, pending_replace, ...) are still live: "new".
-        status = _STATUS_MAP.get(str(raw), "new")
-        price = o.filled_avg_price
-        return OrderStatus(
-            status,
-            int(float(o.filled_qty or 0)),
-            float(price) if price is not None else None,
-        )
+        return _to_status(with_retries(lambda: self._client.get_order_by_id(order_id)))
+
+    def order_by_client_id(self, client_order_id: str) -> tuple[str, OrderStatus] | None:
+        """(order id, status), or None if Alpaca has no order with this client id (404)."""
+        try:
+            o = self._client.get_order_by_client_id(client_order_id)
+        except APIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return str(o.id), _to_status(o)
+
+    def open_orders(self) -> list[str]:
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        return [str(o.id) for o in with_retries(lambda: self._client.get_orders(req))]
+
+    def cancel_all_open(self) -> None:
+        with_retries(lambda: self._client.cancel_orders())
 
     def positions(self) -> dict[str, int]:
         pos = with_retries(lambda: self._client.get_all_positions())

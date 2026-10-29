@@ -26,6 +26,7 @@ from .journal import Journal
 from .models import ET, Bar, ClosedTrade, ExitReason, OptionQuote, OrbResult, Position
 from .orb import evaluate_orb
 from .orders import Fill, Orders, Settled, UnsettledOrderError
+from .orphans import Orphans, cancel_open_orders
 
 STARTUP_AT = time(9, 25)
 AFFORDABILITY_AT = time(9, 40)
@@ -98,6 +99,7 @@ class Session:
         self._trigger_closes: dict[str, float] = {}  # ticket id -> signal's trigger close
 
         self.orders = Orders(broker, self.clock, self._event)
+        self.orphans = Orphans(broker, self.orders, self._event)
         self.position: Position | None = None
         self._trade_id: int | None = None
         self._pending_entry: tuple[Ticket, str] | None = None  # entry whose buy is unsettled
@@ -156,6 +158,7 @@ class Session:
         self.entry_end, self.flat_time = session_times(
             self.hours, self.settings.exits, self.settings.strategy
         )
+        cancel_open_orders(self.broker, self.clock, self._event)
         self._reconcile()
         self.signaled |= self.journal.signaled_on(self.today)  # restart-safe: one signal a day
         self._load_prior_bars()
@@ -182,7 +185,7 @@ class Session:
             self._event("info", f"resumed managing trade {trade_id} {sym} x{self.position.qty}")
         for sym, qty in held.items():
             if sym not in known:
-                self._event("warn", f"broker position {sym} x{qty} not in journal: not managed")
+                self.orphans.add(sym, qty, f"{self.flat_time:%H:%M}")
 
     def _load_prior_bars(self) -> None:
         day = self.today
@@ -404,7 +407,7 @@ class Session:
     def enter(self, ticket: Ticket) -> Position | None:
         sym = ticket.option_symbol
         fill = self.orders.execute(
-            lambda: self.broker.buy_limit(sym, ticket.qty, ticket.limit), sym, "buy",
+            lambda cid: self.broker.buy_limit(sym, ticket.qty, ticket.limit, cid), sym, "buy",
             ticket.qty, ENTRY_TIMEOUT,
         )
         if not fill.settled:  # broker positions decide the qty until the order settles
@@ -460,6 +463,8 @@ class Session:
             filled = min(st.filled_qty, self._remaining())
             if filled > 0:
                 self._book_sale(s.order_id, filled, st.avg_price, self._last_price)
+        elif self.orphans.book(s):
+            pass
         elif st.filled_qty:
             self._event("warn", f"order {s.order_id} ({s.side} {s.symbol}) settled with "
                                 f"{st.filled_qty} filled and no open trade to book it to")
@@ -542,7 +547,8 @@ class Session:
         return left
 
     def _record_exit(self, fill: Fill, qty: int, fallback: float) -> None:
-        self._exit_oids.add(fill.order_id)
+        if fill.order_id:  # "" = not placed
+            self._exit_oids.add(fill.order_id)
         if not fill.settled:
             self._exit_unsettled_seen = True
             raise ExitPaused(f"exit order {fill.order_id} unsettled")
@@ -564,12 +570,12 @@ class Session:
             bid = self._current_bid(sym)
             if bid <= 0:
                 break
-            fill = self.orders.execute(lambda: self.broker.sell_limit(sym, qty, bid),
+            fill = self.orders.execute(lambda cid: self.broker.sell_limit(sym, qty, bid, cid),
                                        sym, "sell", qty, EXIT_LIMIT_TIMEOUT)
             self._record_exit(fill, qty, bid)
         qty = self._to_sell()
         if qty > 0:
-            fill = self.orders.execute(lambda: self.broker.sell_market(sym, qty),
+            fill = self.orders.execute(lambda cid: self.broker.sell_market(sym, qty, cid),
                                        sym, "sell", qty, EXIT_MARKET_TIMEOUT)
             self._record_exit(fill, qty, self._last_price)
             if self._to_sell() > 0:
@@ -590,6 +596,16 @@ class Session:
         self._set_position(None, None)
         self._event("info", f"exited {sym} @ {exit_price:.4f} ({reason}), pnl {closed.pnl:+.2f}")
         return closed
+
+    def flatten_orphans(self) -> None:
+        """Sell unknown broker positions at market (from flat time on, every pass)."""
+        try:
+            self._settle_orders()
+            self.orphans.flatten()
+        except UnsettledOrderError:
+            pass  # retried on the next pass
+        except Exception:
+            self._error()
 
     # ---------------------------------------------------------------- the day
     def _beat(self) -> None:
@@ -673,8 +689,12 @@ class Session:
                         pass  # managed every 15 s until it settles
                     except Exception:
                         self._error()
-            elif self._busy() and now >= next_manage:
-                self.manage_position()
+                self.flatten_orphans()
+            elif (self._busy() or (flattened and self.orphans.held)) and now >= next_manage:
+                if self._busy():
+                    self.manage_position()
+                if flattened:
+                    self.flatten_orphans()
                 next_manage = self.clock.now() + MANAGE_EVERY
             else:
                 events = [end_at, now + HEARTBEAT_EVERY]
@@ -686,6 +706,6 @@ class Session:
                     events.append(pending[0] + BAR_FETCH_DELAY)
                 if not flattened:
                     events.append(flat_at)
-                if self._busy():
+                if self._busy() or (flattened and self.orphans.held):
                     events.append(next_manage)
                 self.clock.sleep_until(min(events))

@@ -16,7 +16,8 @@ def make(fill_policy="never"):
 
 
 def sell(o, broker, qty=2):
-    return o.execute(lambda: broker.sell_limit("X", qty, 1.0), "X", "sell", qty, timedelta(seconds=10))
+    return o.execute(lambda cid: broker.sell_limit("X", qty, 1.0, cid), "X", "sell", qty,
+                     timedelta(seconds=10))
 
 
 def test_cancel_is_polled_until_terminal():
@@ -65,3 +66,44 @@ def test_status_exception_cancels_and_tracks_order():
     o.refresh()
     (s,) = o.collect()
     assert s.status.status == "canceled"
+
+
+def test_submit_error_order_found_by_client_id_is_tracked_unsettled():
+    o, broker, _, events = make("fill")
+    broker.place_raises = "after"  # the order reached Alpaca; the response was lost
+    fill = sell(o, broker)
+    assert (fill.order_id, fill.settled) == ("o1", False)
+    assert o.unsettled == {"o1": ("X", "sell")}
+    assert broker.cid_lookups == [broker.cids["o1"]]
+    assert any("o1" in m for _, m in events)
+    o.refresh()
+    (s,) = o.collect()
+    assert (s.order_id, s.status.status, s.status.filled_qty) == ("o1", "filled", 2)
+
+
+def test_submit_error_lookup_is_retried():
+    o, broker, _, _ = make("fill")
+    broker.place_raises = "after"
+    broker.lookup_fails = 2
+    fill = sell(o, broker)
+    assert (fill.order_id, fill.settled) == ("o1", False)
+    assert len(broker.cid_lookups) == 3
+
+
+def test_submit_error_order_not_found_is_not_placed():
+    o, broker, _, events = make("fill")
+    broker.place_raises = "before"
+    fill = sell(o, broker)
+    assert (fill.order_id, fill.qty, fill.settled) == ("", 0, True)
+    assert o.unsettled == {} and broker.orders == []
+    assert any("not placed" in m for _, m in events)
+    broker.place_raises = None
+    assert sell(o, broker).settled  # nothing blocks the next order
+
+
+def test_submit_error_and_lookup_down_reraises():
+    o, broker, _, _ = make("fill")
+    broker.place_raises = "after"
+    broker.lookup_fails = 99
+    with pytest.raises(RuntimeError, match="submit response lost"):
+        sell(o, broker)
