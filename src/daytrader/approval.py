@@ -194,6 +194,16 @@ class FileApprover:
         return "approved" if value == "approve" else "rejected"
 
 
+def clear_pending(state_dir: Path) -> int:
+    """Remove every pending ticket file (none can still be waited on); return how many."""
+    pending_dir = _dirs(state_dir)[0]
+    removed = 0
+    for f in pending_dir.glob("*.json") if pending_dir.is_dir() else ():
+        f.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
 def write_decision(state_dir: Path, ticket_id: str, decision: str) -> bool:
     if not _valid_id(ticket_id):
         return False

@@ -1087,3 +1087,56 @@ def test_reconcile_resize_logs_managed_qty(env):
     env.broker._positions["AAAC"] = 1
     env.session.startup()
     assert any("resumed" in m and "x1" in m for _, m in env.events("info"))
+
+
+# ------------------------------------------------------------- startup (I3)
+def test_startup_failures_are_retried_every_30s(tmp_path):
+    e = Env(tmp_path, data_cls=DayData, start=at(9, 0))
+    e.add("AAA")
+    e.data.fail["market_hours"] = RuntimeError("calendar timeout")
+    e.data.fail_times["market_hours"] = 2
+    e.broker.positions_fails = 1
+    e.session.run_day()
+    warns = [m for _, m in e.events("warn") if "startup failed" in m]
+    assert len(warns) == 3 and "calendar timeout" in warns[0]
+    assert e.trade_rows()[0][5] == "take_profit"  # the day went ahead
+    e.journal.close()
+
+
+def test_startup_gives_up_after_0944(tmp_path):
+    e = Env(tmp_path, start=at(9, 0))
+    e.add("AAA")
+    e.data.fail["market_hours"] = RuntimeError("calendar down")
+    e.session.run_day()
+    warns = [ts for ts, lv, m in e.journal._conn.execute("SELECT ts, level, message FROM events")
+             if lv == "warn" and "startup failed" in m]
+    assert warns[0] == at(9, 25).isoformat() and warns[1] == at(9, 25, 30).isoformat()
+    errors = e.events("error")
+    assert len(errors) == 1 and "giving up" in errors[0][1]
+    assert e.clock.now() == at(9, 44)
+    assert e.broker.orders == [] and e.data.bar_calls == []
+    e.journal.close()
+
+
+def test_startup_warmup_failure_after_0944_stops_entries_but_manages(tmp_path):
+    e = Env(tmp_path, start=at(9, 0))
+    e.add("AAA")
+    _journal_position(e)
+    e.broker._positions["AAAC"] = 2
+    e.data.fail["bars_5min"] = RuntimeError("bars down")
+    e.session.run_day()
+    assert e.session.no_new_entries
+    assert len(e.events("error")) == 1
+    assert e.trade_rows()[0][5] == "time"  # the resumed position was still flattened
+    assert [o["side"] for o in e.broker.orders] == ["sell"]
+    e.journal.close()
+
+
+def test_approval_startup_clears_stale_pending_tickets(tmp_path):
+    e = Env(tmp_path, mode="approval")
+    pend = tmp_path / "state" / "approval" / "pending"
+    pend.mkdir(parents=True)
+    (pend / "old.json").write_text("{}")
+    e.session.startup()
+    assert list(pend.iterdir()) == []
+    e.journal.close()

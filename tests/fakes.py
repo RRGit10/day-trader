@@ -80,6 +80,7 @@ class FakeBroker:
         self.cid_lookups: list[str] = []
         self.cids: dict[str, str] = {}  # order id -> client order id
         self.cancel_all_calls = 0
+        self.positions_fails = 0  # the next N positions() calls raise
         self.cancels: list[str] = []
         self.orders: list[dict] = []
         self.market_price: dict[str, float] = {}
@@ -194,6 +195,9 @@ class FakeBroker:
         return OrderStatus(s["status"], s["filled"], s["price"])
 
     def positions(self) -> dict[str, int]:
+        if self.positions_fails > 0:
+            self.positions_fails -= 1
+            raise RuntimeError("positions unavailable")
         return dict(self._positions)
 
 
@@ -201,18 +205,29 @@ class LiveFakeData(FakeData):
     """FakeData for session tests.
 
     Option quotes stored with ts=None are stamped with the clock's current time.
-    `fail[method] = exc` makes that method raise. `bar_calls` records each bars fetch.
+    `fail[method] = exc` makes that method raise; `fail_times[method] = n` limits that to
+    the next n calls. `bar_calls` records each bars fetch.
     """
 
     def __init__(self, clock: FakeClock) -> None:
         super().__init__()
         self.clock = clock
         self.fail: dict[str, Exception] = {}
+        self.fail_times: dict[str, int] = {}
         self.bar_calls: list[tuple[list[str], datetime]] = []
 
     def _maybe_fail(self, name: str) -> None:
         if name in self.fail:
+            if name in self.fail_times:
+                self.fail_times[name] -= 1
+                if self.fail_times[name] <= 0:
+                    del self.fail_times[name]
+                    raise self.fail.pop(name)
             raise self.fail[name]
+
+    def market_hours(self, day):
+        self._maybe_fail("market_hours")
+        return super().market_hours(day)
 
     def set_quote(self, symbol: str, bid: float, ask: float, ts: datetime | None = None) -> None:
         self.option_quotes[symbol] = (bid, ask, ts)

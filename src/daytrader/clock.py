@@ -4,7 +4,7 @@ from __future__ import annotations
 import time as _time
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
-from typing import Protocol
+from typing import Callable, Protocol, TypeVar
 
 from .config import ExitConfig, StrategyConfig
 from .models import ET
@@ -26,6 +26,32 @@ class SystemClock:
             if remaining <= 0:
                 return
             _time.sleep(min(1.0, remaining))
+
+
+T = TypeVar("T")
+
+
+def retry_until(
+    fn: Callable[[], T],
+    clock: Clock,
+    deadline: datetime,
+    every: timedelta,
+    on_failure: Callable[[Exception], None],
+    fatal: tuple[type[BaseException], ...] = (),
+) -> T:
+    """Call fn until it succeeds, waiting `every` between failed attempts (the last attempt
+    is at `deadline`). Each failure before the deadline goes to on_failure; the failure at
+    or after the deadline, and any `fatal` exception, is raised."""
+    while True:
+        try:
+            return fn()
+        except fatal:
+            raise
+        except Exception as exc:
+            if clock.now() >= deadline:
+                raise
+            on_failure(exc)
+            clock.sleep_until(min(clock.now() + every, deadline))
 
 
 @dataclass(frozen=True)

@@ -256,6 +256,67 @@ def test_run_ctrl_c_exits_130_and_removes_lock(cfg, keys, tmp_path):
     assert not (tmp_path / "state" / "run-approval.lock").exists()
 
 
+def _flaky_broker(fails, built, exc=RuntimeError("connection reset")):
+    def make(keys, mode):
+        built.append(mode)
+        if len(built) <= fails:
+            raise exc
+        return object()
+    return make
+
+
+def test_run_retries_broker_build_on_network_errors(cfg, keys, tmp_path):
+    clock = FakeClock(NOW.replace(hour=9, minute=25))
+    built = []
+    deps = cli.Deps(data=lambda k: FakeData(), broker=_flaky_broker(2, built),
+                    clock=lambda: clock, now=clock.now)
+    assert run(cfg, "run", "--mode", "bot", deps=deps) == 0
+    assert len(built) == 3 and clock.now() >= NOW.replace(hour=9, minute=26)
+    j = Journal(tmp_path / "state" / "journal-bot.db")
+    warns = [m for lv, m in j._conn.execute("SELECT level, message FROM events") if lv == "warn"]
+    j.close()
+    assert len(warns) == 2 and "connection reset" in warns[0]
+
+
+def test_run_gives_up_building_broker_after_0944(cfg, keys, tmp_path, capsys):
+    clock = FakeClock(NOW.replace(hour=9, minute=43))
+    built = []
+    deps = cli.Deps(data=lambda k: FakeData(), broker=_flaky_broker(99, built),
+                    clock=lambda: clock, now=clock.now)
+    assert run(cfg, "run", "--mode", "bot", deps=deps) == 1
+    assert len(built) == 3  # 09:43:00, 09:43:30, 09:44:00
+    assert "giving up" in capsys.readouterr().out
+    assert not (tmp_path / "state" / "run-bot.lock").exists()
+
+
+def test_run_paper_lock_error_exits_immediately(cfg, keys, tmp_path, capsys):
+    clock = FakeClock(NOW.replace(hour=9, minute=25))
+    built = []
+    deps = cli.Deps(data=lambda k: FakeData(),
+                    broker=_flaky_broker(99, built, PaperLockError("keys rejected")),
+                    clock=lambda: clock, now=clock.now)
+    assert run(cfg, "run", "--mode", "bot", deps=deps) == 1
+    assert built == ["bot"] and clock.now() == NOW.replace(hour=9, minute=25)
+    assert "keys rejected" in capsys.readouterr().out
+
+
+def test_run_approval_heartbeats_while_waiting_for_a_decision(cfg, keys, monkeypatch):
+    made = []
+
+    class Recorder(cli.Session):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            made.append(self)
+
+    monkeypatch.setattr(cli, "Session", Recorder)
+    clock = FakeClock(NOW.replace(hour=9, minute=0))
+    deps = cli.Deps(data=lambda k: FakeData(), broker=lambda k, m: object(),
+                    clock=lambda: clock, now=clock.now)
+    assert run(cfg, "run", "--mode", "approval", deps=deps) == 0
+    (session,) = made
+    assert session.approver.on_poll == session.write_heartbeat
+
+
 def test_run_missing_keys_removes_lock(cfg, tmp_path, capsys):
     assert run(cfg, "run", "--mode", "bot") == 1
     assert "missing API keys" in capsys.readouterr().out

@@ -14,9 +14,9 @@ from dataclasses import replace
 from datetime import datetime, time, timedelta
 from typing import Literal
 
-from .approval import Approver, Ticket
+from .approval import Approver, Ticket, clear_pending
 from .broker import Broker
-from .clock import Clock, MarketHours, session_times
+from .clock import Clock, MarketHours, retry_until, session_times
 from .config import Settings
 from .contracts import contracts_for_budget, entry_limit_price, pick_contract
 from .data import MarketData
@@ -31,6 +31,8 @@ from .orphans import Orphans, cancel_open_orders
 STARTUP_AT = time(9, 25)
 AFFORDABILITY_AT = time(9, 40)
 AFFORDABILITY_RETRY_AT = time(9, 44)
+STARTUP_GIVE_UP_AT = time(9, 44)
+STARTUP_RETRY_EVERY = timedelta(seconds=30)
 HEARTBEAT_EVERY = timedelta(seconds=15)
 BAR_FETCH_DELAY = timedelta(seconds=5)
 BAR_RETRY_EVERY = timedelta(seconds=10)
@@ -96,7 +98,8 @@ class Session:
         self.no_new_entries = False
         self._afford_retry: list[str] = []  # tickers whose 09:40 check failed on an error
         self._empty_scan_noted = False
-        self._trigger_closes: dict[str, float] = {}  # ticket id -> signal's trigger close
+        self._trigger_closes: dict[str, float] = {}
+        self._startup_done: set[str] = set()  # ticket id -> signal's trigger close
 
         self.orders = Orders(broker, self.clock, self._event)
         self.orphans = Orphans(broker, self.orders, self._event)
@@ -150,18 +153,48 @@ class Session:
 
     # ---------------------------------------------------------------- startup
     def startup(self) -> None:
-        self.today = self.clock.now().date()
-        self.hours = self.data.market_hours(self.today)
+        """One attempt at the startup steps not yet done; raises if a step fails
+        (run_day retries every 30 s until 09:44)."""
+        done = self._startup_done
+        if "hours" not in done:
+            self.today = self.clock.now().date()
+            self.hours = self.data.market_hours(self.today)
+            done.add("hours")
+            if self.hours is not None:
+                self.entry_end, self.flat_time = session_times(
+                    self.hours, self.settings.exits, self.settings.strategy
+                )
+            else:
+                self._event("info", f"market closed on {self.today.isoformat()}")
         if self.hours is None:
-            self._event("info", f"market closed on {self.today.isoformat()}")
             return
-        self.entry_end, self.flat_time = session_times(
-            self.hours, self.settings.exits, self.settings.strategy
-        )
-        cancel_open_orders(self.broker, self.clock, self._event)
-        self._reconcile()
-        self.signaled |= self.journal.signaled_on(self.today)  # restart-safe: one signal a day
-        self._load_prior_bars()
+        if "broker" not in done:
+            if self.mode == "approval":
+                clear_pending(self.settings.state_dir)  # no old ticket can be approved now
+            cancel_open_orders(self.broker, self.clock, self._event)
+            self._reconcile()
+            self.signaled |= self.journal.signaled_on(self.today)  # restart-safe: one a day
+            done.add("broker")
+        if "prior_bars" not in done:
+            self._load_prior_bars()
+            done.add("prior_bars")
+
+    def _start(self) -> bool:
+        """startup() with retries; False if the day cannot be traded or managed at all."""
+        def failed(exc: Exception) -> None:
+            self._event("warn", f"startup failed ({exc!r}); retrying in "
+                                f"{STARTUP_RETRY_EVERY.seconds}s")
+        try:
+            retry_until(self.startup, self.clock, self._at(STARTUP_GIVE_UP_AT),
+                        STARTUP_RETRY_EVERY, failed)
+            return True
+        except Exception:
+            self._event("error", "startup failed; giving up for today:\n"
+                                 + traceback.format_exc())
+        if {"hours", "broker"} <= self._startup_done:  # only the warm-up is missing:
+            self.no_new_entries = True  # no entries, but manage and flatten what is held
+            return True
+        return False
 
     def _reconcile(self) -> None:
         held = self.broker.positions()
@@ -189,18 +222,15 @@ class Session:
 
     def _load_prior_bars(self) -> None:
         day = self.today
-        try:
-            for _ in range(PRIOR_DAY_LOOKBACK):
-                day -= timedelta(days=1)
-                hours = self.data.market_hours(day)
-                if hours is not None:
-                    self.prior_bars = self.data.bars_5min(
-                        list(self.settings.tickers), hours.open, hours.close
-                    )
-                    return
-            self._event("warn", "no prior trading day found for indicator warm-up")
-        except Exception:
-            self._event("warn", "prior-day warm-up failed:\n" + traceback.format_exc())
+        for _ in range(PRIOR_DAY_LOOKBACK):
+            day -= timedelta(days=1)
+            hours = self.data.market_hours(day)
+            if hours is not None:
+                self.prior_bars = self.data.bars_5min(
+                    list(self.settings.tickers), hours.open, hours.close
+                )
+                return
+        self._event("warn", "no prior trading day found for indicator warm-up")
 
     # ---------------------------------------------------------- affordability
     def affordability_filter(self) -> list[str]:
@@ -642,8 +672,7 @@ class Session:
         self.today = self.clock.now().date()
         self.clock.sleep_until(self._at(STARTUP_AT))
         self._beat()
-        self.startup()
-        if self.hours is None:
+        if not self._start() or self.hours is None:
             return
         afford_at = self._at(AFFORDABILITY_AT)
         afford_retry_at = self._at(AFFORDABILITY_RETRY_AT)

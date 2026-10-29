@@ -76,13 +76,17 @@ class AlpacaBroker:
         self._client = TradingClient(keys.api_key, keys.api_secret, paper=True)
 
     def verify_paper(self) -> None:
+        """An auth rejection (HTTP 401/403) is a PaperLockError; any other error (network,
+        5xx) is raised unchanged so the caller can retry."""
         try:
             self._client.get_account()
-        except Exception as exc:
-            raise PaperLockError(
-                "could not authenticate with Alpaca: the keys must be Alpaca paper "
-                f"trading keys ({exc})"
-            ) from exc
+        except APIError as exc:
+            if exc.status_code in (401, 403):
+                raise PaperLockError(
+                    "could not authenticate with Alpaca: the keys must be Alpaca paper "
+                    f"trading keys ({exc})"
+                ) from exc
+            raise
 
     def get_account(self):
         return with_retries(lambda: self._client.get_account())

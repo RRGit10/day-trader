@@ -30,19 +30,21 @@ def test_constructor_always_paper():
     assert [c.kwargs["paper"] for c in tc2.call_args_list] == [True, True]
 
 
-def test_verify_paper_turns_api_error_into_paper_lock_error():
+@pytest.mark.parametrize("code", [401, 403])
+def test_verify_paper_auth_rejection_is_paper_lock_error(code):
     b, _ = make_broker_mocked()
     b._client = MagicMock()
-    b._client.get_account.side_effect = APIError('{"message": "forbidden"}')
+    b._client.get_account.side_effect = _api_error(code)
     with pytest.raises(PaperLockError, match="paper"):
         b.verify_paper()
 
 
-def test_verify_paper_turns_any_exception_into_paper_lock_error():
+@pytest.mark.parametrize("exc", [RuntimeError("net"), APIError('{"message": "x"}')])
+def test_verify_paper_network_errors_are_not_paper_lock_errors(exc):
     b, _ = make_broker_mocked()
     b._client = MagicMock()
-    b._client.get_account.side_effect = RuntimeError("net")
-    with pytest.raises(PaperLockError, match="paper"):
+    b._client.get_account.side_effect = exc
+    with pytest.raises(type(exc)):
         b.verify_paper()
 
 
@@ -60,7 +62,7 @@ def test_make_broker_missing_keys():
 
 def test_make_broker_verifies():
     with patch.object(broker_mod, "TradingClient") as tc:
-        tc.return_value.get_account.side_effect = RuntimeError("401")
+        tc.return_value.get_account.side_effect = _api_error(401)
         with pytest.raises(PaperLockError):
             make_broker(KEYS, "bot")
 
