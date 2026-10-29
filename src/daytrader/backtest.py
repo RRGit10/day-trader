@@ -1,8 +1,8 @@
 """Backtest: replay past trading days through the same pure decision modules as the session.
 
 Conservative by construction: no option bar inside the trigger bar means no quote
-("no_data"), stops are checked before profits within a bar, and every fill pays half
-of the assumed spread.
+("no_data"), stops are checked before profits within a bar, stops that gap fill at the
+bar open while profits never get gap credit, and every fill pays half of the assumed spread.
 """
 from __future__ import annotations
 
@@ -193,13 +193,15 @@ class _Day:
         t = start
         while t < flat:
             ob = opt.get(t)
-            hi, lo, last = (ob.h, ob.l, ob.c) if ob is not None else (last, last, last)
+            op, hi, lo, last = (ob.o, ob.h, ob.l, ob.c) if ob is not None else (last,) * 4
             sb = stock.get(t)
             done = t + ONE_MIN
+            # stops: a gap through the level fills at the (worse) open; profits never get gap credit
             if round(lo, 6) <= round(stop, 6):
-                return "stop_loss", stop * (1 - h), done
+                return "stop_loss", min(op, stop) * (1 - h), done
             if sb is not None and ((sb.l <= pos.range_mid) if long else (sb.h >= pos.range_mid)):
-                return "stock_stop", last * (1 - h), done
+                gapped = (sb.o <= pos.range_mid) if long else (sb.o >= pos.range_mid)
+                return "stock_stop", (min(op, last) if gapped else last) * (1 - h), done
             if round(hi, 6) >= round(target, 6):
                 return "take_profit", target * (1 - h), done
             if sb is not None and ((sb.h >= pos.stock_target) if long else (sb.l <= pos.stock_target)):
