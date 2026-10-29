@@ -54,6 +54,22 @@ def retry_until(
             clock.sleep_until(min(clock.now() + every, deadline))
 
 
+STARTUP_GIVE_UP_AT = time(9, 44)
+STARTUP_RETRY_EVERY = timedelta(seconds=30)
+LATE_START_RETRY_FOR = timedelta(minutes=10)
+
+
+def startup_deadline(launch: datetime, flat_time: time) -> datetime:
+    """Last startup attempt. A normal start retries until 09:44 ET; a start at or after
+    09:44 (a crash restart, which must resume managing positions) retries for 10 minutes
+    from launch, never past flat time (controller ruling 10)."""
+    give_up = datetime.combine(launch.date(), STARTUP_GIVE_UP_AT, tzinfo=launch.tzinfo)
+    if launch < give_up:
+        return give_up
+    return min(launch + LATE_START_RETRY_FOR,
+               datetime.combine(launch.date(), flat_time, tzinfo=launch.tzinfo))
+
+
 @dataclass(frozen=True)
 class MarketHours:
     open: datetime

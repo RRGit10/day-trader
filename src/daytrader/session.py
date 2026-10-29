@@ -16,7 +16,14 @@ from typing import Literal
 
 from .approval import Approver, Ticket, clear_pending
 from .broker import Broker
-from .clock import Clock, MarketHours, retry_until, session_times
+from .clock import (
+    STARTUP_RETRY_EVERY,
+    Clock,
+    MarketHours,
+    retry_until,
+    session_times,
+    startup_deadline,
+)
 from .config import Settings
 from .contracts import contracts_for_budget, entry_limit_price, pick_contract
 from .data import MarketData
@@ -31,8 +38,6 @@ from .orphans import Orphans, cancel_open_orders
 STARTUP_AT = time(9, 25)
 AFFORDABILITY_AT = time(9, 40)
 AFFORDABILITY_RETRY_AT = time(9, 44)
-STARTUP_GIVE_UP_AT = time(9, 44)
-STARTUP_RETRY_EVERY = timedelta(seconds=30)
 HEARTBEAT_EVERY = timedelta(seconds=15)
 BAR_FETCH_DELAY = timedelta(seconds=5)
 BAR_RETRY_EVERY = timedelta(seconds=10)
@@ -180,13 +185,15 @@ class Session:
             done.add("prior_bars")
 
     def _start(self) -> bool:
-        """startup() with retries; False if the day cannot be traded or managed at all."""
+        """startup() with retries (see clock.startup_deadline); False if the day cannot be
+        traded or managed at all."""
+        deadline = startup_deadline(self.clock.now(), self.flat_time)
+
         def failed(exc: Exception) -> None:
             self._event("warn", f"startup failed ({exc!r}); retrying in "
                                 f"{STARTUP_RETRY_EVERY.seconds}s")
         try:
-            retry_until(self.startup, self.clock, self._at(STARTUP_GIVE_UP_AT),
-                        STARTUP_RETRY_EVERY, failed)
+            retry_until(self.startup, self.clock, deadline, STARTUP_RETRY_EVERY, failed)
             return True
         except Exception:
             self._event("error", "startup failed; giving up for today:\n"

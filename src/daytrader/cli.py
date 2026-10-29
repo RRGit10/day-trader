@@ -14,7 +14,7 @@ from typing import Callable, Sequence
 from .approval import AutoApprover, FileApprover, Ticket, write_decision
 from .backtest import run_backtest
 from .broker import PaperLockError, make_broker
-from .clock import SystemClock, retry_until
+from .clock import STARTUP_RETRY_EVERY, SystemClock, retry_until, startup_deadline
 from .config import ConfigError, Keys, Settings, load_settings
 from .contracts import pick_contract
 from .data import AlpacaData
@@ -24,7 +24,7 @@ from .journal import Journal
 from .models import ET
 from .orb import evaluate_orb
 from .report import format_summary, summarize
-from .session import STARTUP_GIVE_UP_AT, STARTUP_RETRY_EVERY, Session
+from .session import Session
 
 BACKTEST_EARLIEST = date(2024, 2, 1)
 STALE_AFTER_S = 60
@@ -154,7 +154,7 @@ def _cmd_run(args, settings: Settings, deps: Deps) -> int:
         def failed(exc: Exception) -> None:
             journal.record_event(clock.now(), "warn", f"connecting to Alpaca failed ({exc!r}); "
                                                       f"retrying in {STARTUP_RETRY_EVERY.seconds}s")
-        give_up = datetime.combine(clock.now().date(), STARTUP_GIVE_UP_AT, tzinfo=ET)
+        give_up = startup_deadline(clock.now(), settings.exits.flat_time)
         try:  # network errors are retried; a rejected key (PaperLockError) is not
             data, broker = retry_until(build, clock, give_up, STARTUP_RETRY_EVERY, failed,
                                        fatal=(PaperLockError, ConfigError))

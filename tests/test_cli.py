@@ -315,6 +315,25 @@ def test_run_gives_up_building_broker_after_0944(cfg, keys, tmp_path, capsys):
     assert not (tmp_path / "state" / "run-bot.lock").exists()
 
 
+def test_run_late_start_retries_broker_build_for_10_minutes(cfg, keys, tmp_path, capsys):
+    clock = FakeClock(NOW.replace(hour=10, minute=30))
+    built = []
+    deps = cli.Deps(data=lambda k: FakeData(), broker=_flaky_broker(99, built),
+                    clock=lambda: clock, now=clock.now)
+    assert run(cfg, "run", "--mode", "bot", deps=deps) == 1
+    assert len(built) == 21 and clock.now() == NOW.replace(hour=10, minute=40)
+    assert "giving up" in capsys.readouterr().out
+
+
+def test_run_late_start_recovers_after_transient_errors(cfg, keys):
+    clock = FakeClock(NOW.replace(hour=10, minute=30))
+    built = []
+    deps = cli.Deps(data=lambda k: FakeData(), broker=_flaky_broker(2, built),
+                    clock=lambda: clock, now=clock.now)
+    assert run(cfg, "run", "--mode", "bot", deps=deps) == 0
+    assert len(built) == 3
+
+
 def test_run_paper_lock_error_exits_immediately(cfg, keys, tmp_path, capsys):
     clock = FakeClock(NOW.replace(hour=9, minute=25))
     built = []

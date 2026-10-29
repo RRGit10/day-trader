@@ -1140,3 +1140,46 @@ def test_approval_startup_clears_stale_pending_tickets(tmp_path):
     e.session.startup()
     assert list(pend.iterdir()) == []
     e.journal.close()
+
+
+# ------------------------------------------------- late start / restart (Ruling 10)
+def test_late_restart_retries_then_resumes_managing(tmp_path):
+    e = Env(tmp_path, start=at(10, 30))
+    e.add("AAA")
+    _journal_position(e)
+    e.broker._positions["AAAC"] = 2
+    e.data.fail["market_hours"] = RuntimeError("calendar timeout")
+    e.data.fail_times["market_hours"] = 2
+    e.session.run_day()
+    warns = [ts for ts, lv, m in e.journal._conn.execute("SELECT ts, level, message FROM events")
+             if lv == "warn" and "startup failed" in m]
+    assert warns == [at(10, 30).isoformat(), at(10, 30, 30).isoformat()]
+    assert e.events("error") == []
+    assert e.trade_rows()[0][5] == "time"  # the resumed position was managed and flattened
+    assert e.broker.positions() == {}
+    e.journal.close()
+
+
+def test_late_restart_gives_up_after_10_minutes(tmp_path):
+    e = Env(tmp_path, start=at(10, 30))
+    e.add("AAA")
+    _journal_position(e)
+    e.broker._positions["AAAC"] = 2
+    e.data.fail["market_hours"] = RuntimeError("calendar down")
+    e.session.run_day()
+    warns = [m for _, m in e.events("warn") if "startup failed" in m]
+    assert len(warns) == 20  # 10:30:00 .. 10:39:30; the 10:40 attempt is the last
+    errors = e.events("error")
+    assert len(errors) == 1 and "giving up" in errors[0][1]
+    assert e.clock.now() == at(10, 40)
+    assert e.broker.orders == []
+    e.journal.close()
+
+
+def test_late_restart_retries_never_past_flat_time(tmp_path):
+    e = Env(tmp_path, start=at(15, 50))
+    e.data.fail["market_hours"] = RuntimeError("calendar down")
+    e.session.run_day()
+    assert e.clock.now() == at(15, 55)
+    assert len(e.events("error")) == 1
+    e.journal.close()
