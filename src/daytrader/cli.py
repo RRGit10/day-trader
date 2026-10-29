@@ -367,8 +367,8 @@ def _cmd_doctor(args, settings: Settings, deps: Deps) -> int:
         line(True, f"{name}: keys verified as paper")
         try:
             level = int(broker.get_account().options_trading_level)
-            line(level >= 2, f"{name}: options trading level {level} "
-                             f"({'buying calls/puts allowed' if level >= 2 else 'need >= 2 to buy calls/puts'})")
+            why = "buying calls/puts allowed" if level >= 2 else "need >= 2 to buy calls/puts"
+            line(level >= 2, f"{name}: options trading level {level} ({why})")
         except Exception as exc:
             line(False, f"{name}: options approval check: {exc!r}")
         try:

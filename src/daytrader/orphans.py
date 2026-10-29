@@ -30,7 +30,8 @@ def cancel_open_orders(broker: Broker, clock: Clock, event: Callable[[str, str],
     deadline = clock.now() + CANCEL_ALL_WAIT
     while broker.open_orders():
         if clock.now() >= deadline:
-            raise RuntimeError(f"open orders still open {CANCEL_ALL_WAIT.seconds}s after cancel-all")
+            raise RuntimeError(
+                f"open orders still open {CANCEL_ALL_WAIT.seconds}s after cancel-all")
         clock.sleep_until(min(clock.now() + CANCEL_ALL_POLL, deadline))
 
 

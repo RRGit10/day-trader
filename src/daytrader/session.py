@@ -454,7 +454,8 @@ class Session:
         pos = Position(  # stock R from the trigger close, as on the ticket and in the backtest
             ticker=ticket.ticker, direction=ticket.direction, option_symbol=ticket.option_symbol,
             qty=qty, entry_price=avg_price if avg_price is not None else ticket.limit,
-            entry_stock_price=self._trigger_closes[ticket.id], range_mid=ticket.stock_stop, opened_at=self.clock.now(),
+            entry_stock_price=self._trigger_closes[ticket.id], range_mid=ticket.stock_stop,
+            opened_at=self.clock.now(),
         )
         self._set_position(pos, self.journal.open_trade(pos))
         note = "" if qty == ticket.qty else f" (partial: {qty}/{ticket.qty})"
