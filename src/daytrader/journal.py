@@ -120,9 +120,10 @@ class Journal:
         )
         return ClosedTrade(ticker=ticker, pnl=pnl, closed_at=closed_at, reason=reason)
 
-    def update_trade_qty(self, trade_id: int, qty: int) -> None:
+    def amend_open_trade(self, trade_id: int, qty: int, entry_price: float) -> None:
         cur = self._write(
-            "UPDATE trades SET qty=? WHERE id=? AND closed_at IS NULL", (qty, trade_id)
+            "UPDATE trades SET qty=?, entry_price=? WHERE id=? AND closed_at IS NULL",
+            (qty, entry_price, trade_id),
         )
         if cur.rowcount != 1:
             raise ValueError(f"no open trade with id {trade_id}")

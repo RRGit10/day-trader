@@ -558,7 +558,7 @@ def test_entry_order_stuck_after_cancel_uses_broker_positions(env):
     env.open_day()
     env.session.on_bar_close(at(9, 55))
     assert env.session.position is None
-    assert any("o1" in m for _, m in env.events("error"))
+    assert any("o1" in m and "unsettled" in m for _, m in env.events("warn"))
     assert env.clock.now() >= at(9, 55, 5) + timedelta(seconds=60 + 20)
 
     env.broker.force_fill("o1")  # the "cancelled" buy fills after all
@@ -579,7 +579,7 @@ def test_entry_status_failure_tracks_order_and_uses_broker_positions(tmp_path):
     e.session.on_bar_close(at(9, 55))
     assert e.broker.cancels == ["o1"]  # the live order was cancelled, not abandoned
     assert e.session.position is not None and e.session.position.qty == 1
-    assert e.events("error")
+    assert any("o1" in m and "unsettled" in m for _, m in e.events("warn"))
 
     e.broker.status_fails = False
     e.session.on_bar_close(at(10, 0))
@@ -714,3 +714,109 @@ def test_market_fill_without_avg_price_uses_last_known_price(env):
     assert [o["type"] for o in _sells(env)] == ["market"]
     assert env.trade_rows()[0][3] == 0.05
     assert any("avg" in m for _, m in env.events("error"))
+
+
+# ---------------------------------------------------------------- review round 2
+def test_reviewer_repro_exit_order_settles_between_refreshes_no_oversell(env):
+    _enter_aaa(env)
+    env.broker.fill_policy = "never"
+    env.broker.cancel_delay_reads = 10_000
+    _stop_out(env, "AAA")  # o2 unsettled
+    assert env.session.position is not None
+
+    env.broker._state["o2"]["cancel_reads"] = 1  # settles on the 2nd status read from now
+    env.broker.fill_during_cancel = True
+    env.broker.fill_policy = "fill"
+    for _ in range(3):
+        env.clock.advance(15)
+        env.session.manage_position()
+    assert [(o["type"], o["qty"]) for o in _sells(env)] == [("limit", 2)]
+    assert env.broker.positions() == {}  # never short
+    assert env.session.position is None
+    assert env.trade_rows()[0][3:] == (2.20, -60.0, "stop_loss")  # o2's fill was booked
+
+
+def test_unsettled_exit_journals_once_not_every_cycle(env):
+    _enter_aaa(env)
+    env.broker.fill_policy = "never"
+    env.broker.cancel_delay_reads = 10_000
+    _stop_out(env, "AAA")
+    for _ in range(4):
+        env.clock.advance(15)
+        env.session.manage_position()
+    assert env.events("error") == []
+    assert sum("unsettled" in m for _, m in env.events("warn")) == 1
+
+
+def test_position_gone_at_broker_while_exit_unsettled_closes_from_booked_fills(env):
+    _enter_aaa(env)
+    env.broker.fill_policy = "never"
+    env.broker.status_fails = True  # o2's status can never be read
+    env.broker.cancel_delay_reads = 10_000
+    _stop_out(env, "AAA")
+    env.broker._positions.clear()  # ...but the broker no longer holds the contracts
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert env.session.position is None
+    ticker, qty, entry, exit_price, pnl, reason = env.trade_rows()[0]
+    assert (qty, reason) == (2, "stop_loss") and exit_price > 0
+    assert len(_sells(env)) == 1
+
+
+def test_exit_sell_capped_at_broker_held_qty_after_unsettled(env):
+    _enter_aaa(env)
+    env.broker.fill_policy = "never"
+    env.broker.status_fails = True
+    _stop_out(env, "AAA")  # o2 unsettled (cancelled; status unreadable)
+    env.broker._positions["AAAC"] = 1  # something else sold one contract
+    env.broker.status_fails = False
+    env.broker.fill_policy = "fill"
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert [o["qty"] for o in _sells(env)] == [2, 1]
+    assert env.broker.positions() == {}
+    assert env.session.position is None
+
+
+def test_pending_entry_settled_late_uses_real_avg_fill(env):
+    env.broker.fill_policy = "never"
+    env.broker.cancel_delay_reads = 10_000
+    env.add("AAA")
+    env.open_day()
+    env.session.on_bar_close(at(9, 55))
+    assert env.session.position is None
+    st = env.broker._state["o1"]
+    st["fill_price"] = 2.48  # real fill better than the 2.50 limit
+    env.broker.force_fill("o1")
+    env.clock.advance(15)
+    env.session.manage_position()
+    pos = env.session.position
+    assert (pos.qty, pos.entry_price) == (2, 2.48)
+    assert env.journal.open_trades()[0][1].entry_price == 2.48
+
+
+def test_pending_entry_opened_from_positions_then_amended_on_settle(env):
+    env.broker.fill_policy = "never"
+    env.broker.cancel_delay_reads = 10_000
+    env.add("AAA")
+    env.open_day()
+    env.session.on_bar_close(at(9, 55))
+    env.broker._state["o1"]["fill_price"] = 2.47
+    env.broker._positions["AAAC"] = 2  # broker shows the contracts before the status settles
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert env.session.position.entry_price == 2.50  # provisional: limit price
+    env.broker.force_fill("o1")  # positions already counted; status now terminal
+    env.broker._positions["AAAC"] = 2
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert (env.session.position.qty, env.session.position.entry_price) == (2, 2.47)
+    assert env.journal.open_trades()[0][1].entry_price == 2.47
+
+
+def test_reconcile_resize_logs_managed_qty(env):
+    env.add("AAA")
+    _journal_position(env, qty=2)
+    env.broker._positions["AAAC"] = 1
+    env.session.startup()
+    assert any("resumed" in m and "x1" in m for _, m in env.events("info"))

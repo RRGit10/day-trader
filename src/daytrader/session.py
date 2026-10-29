@@ -25,7 +25,7 @@ from .guard import may_enter
 from .journal import Journal
 from .models import ET, Bar, ClosedTrade, ExitReason, OptionQuote, OrbResult, Position
 from .orb import evaluate_orb
-from .orders import Fill, Orders
+from .orders import Fill, Orders, Settled, UnsettledOrderError
 
 STARTUP_AT = time(9, 25)
 AFFORDABILITY_AT = time(9, 40)
@@ -41,6 +41,10 @@ EXIT_MARKET_TIMEOUT = timedelta(seconds=60)
 REQUOTE_TOLERANCE = 0.05
 SUMMARY_AFTER_CLOSE = timedelta(minutes=5)
 PRIOR_DAY_LOOKBACK = 7
+
+
+class ExitPaused(RuntimeError):
+    """An exit order is unsettled; the exit resumes once it settles (journaled once by Orders)."""
 
 
 class Session:
@@ -75,10 +79,7 @@ class Session:
         self.position: Position | None = None
         self._trade_id: int | None = None
         self._pending_entry: tuple[Ticket, str] | None = None  # entry whose buy is unsettled
-        self._sold: list[tuple[int, float]] = []  # exit fills (qty, price) for the open position
-        self._resync_needed = False  # an exit order went unsettled: re-read broker qty first
-        self._last_price = 0.0  # last known option price for the open position
-        self._stale_warned = False
+        self._set_position(None, None)
 
     # ---------------------------------------------------------------- helpers
     def _at(self, t: time) -> datetime:
@@ -105,15 +106,22 @@ class Session:
 
     def _set_position(self, pos: Position | None, trade_id: int | None) -> None:
         self.position, self._trade_id = pos, trade_id
-        self._sold = []
-        self._resync_needed = False
-        self._last_price = pos.entry_price if pos is not None else 0.0
+        self._sold: list[tuple[int, float]] = []  # exit fills (qty, price) for this position
+        self._exit_oids: set[str] = set()  # exit orders placed for this position
+        self._exit_reason: ExitReason | None = None  # set once an exit has started
+        self._exit_unsettled_seen = False  # then broker positions cap every further sell
+        self._last_price = pos.entry_price if pos is not None else 0.0  # last known option price
         self._stale_warned = False
 
-    def _resize(self, qty: int, why: str) -> None:
-        self._event("warn", f"{self.position.option_symbol}: qty {self.position.qty} -> {qty} ({why})")
-        self.position = replace(self.position, qty=qty)
-        self.journal.update_trade_qty(self._trade_id, qty)
+    def _amend(self, qty: int, entry_price: float, why: str) -> None:
+        old = self.position
+        self.position = replace(old, qty=qty, entry_price=entry_price)
+        self.journal.amend_open_trade(self._trade_id, qty, entry_price)
+        self._event("warn", f"{old.option_symbol}: qty {old.qty} -> {qty}, entry "
+                            f"{old.entry_price:.2f} -> {entry_price:.2f} ({why})")
+
+    def _held(self) -> int:
+        return self.broker.positions().get(self.position.option_symbol, 0)
 
     # ---------------------------------------------------------------- startup
     def startup(self) -> None:
@@ -144,11 +152,11 @@ class Session:
                 continue
             self._set_position(pos, trade_id)
             if held[sym] < pos.qty:
-                self._resize(held[sym], "broker holds fewer than the journal")
+                self._amend(held[sym], pos.entry_price, "broker holds fewer than the journal")
             elif held[sym] > pos.qty:
                 self._event("warn", f"{sym}: broker holds {held[sym]} > journal {pos.qty}; "
                                     f"managing {pos.qty}")
-            self._event("info", f"resumed managing trade {trade_id} {sym} x{pos.qty}")
+            self._event("info", f"resumed managing trade {trade_id} {sym} x{self.position.qty}")
         for sym, qty in held.items():
             if sym not in known:
                 self._event("warn", f"broker position {sym} x{qty} not in journal: not managed")
@@ -250,6 +258,9 @@ class Session:
         if self.no_new_entries:
             self._skip(tk, "no_new_entries")
             return
+        if not self._settle_orders():
+            self._skip(tk, "unsettled_order", ", ".join(sorted(self.orders.unsettled)))
+            return
         ok, why = may_enter(self._trades_today(), self._busy(), self.settings.risk)
         if not ok:
             self._skip(tk, str(why))
@@ -313,12 +324,12 @@ class Session:
     def enter(self, ticket: Ticket) -> Position | None:
         sym = ticket.option_symbol
         fill = self.orders.execute(
-            lambda: self.broker.buy_limit(sym, ticket.qty, ticket.limit), sym, ticket.qty,
-            ENTRY_TIMEOUT,
+            lambda: self.broker.buy_limit(sym, ticket.qty, ticket.limit), sym, "buy",
+            ticket.qty, ENTRY_TIMEOUT,
         )
         if not fill.settled:  # broker positions decide the qty until the order settles
             self._pending_entry = (ticket, fill.order_id)
-            self._sync_pending_entry()
+            self._settle_orders()
             return self.position
         filled = min(fill.qty, ticket.qty)
         if filled <= 0:
@@ -342,32 +353,70 @@ class Session:
         self._event("info", f"entered {pos.option_symbol} x{qty} @ {pos.entry_price:.2f}{note}")
         return pos
 
-    def _sync_pending_entry(self) -> None:
-        ticket, oid = self._pending_entry
-        settled = self.orders.refresh()
-        held = min(self.broker.positions().get(ticket.option_symbol, 0), ticket.qty)
-        st = settled.get(oid)
-        if self.position is None and held > 0:
-            self._open(ticket, held, st.avg_price if st is not None else None)
-        elif self.position is not None and 0 < held != self.position.qty and not self._sold:
-            self._resize(held, "broker position while the entry order was unsettled")
-        if oid not in self.orders.unsettled:
-            self._pending_entry = None
-            if self.position is None:
+    # ------------------------------------------------------- order settlement
+    def _settle_orders(self) -> bool:
+        """Book every order that settled since last time; True when none is still unsettled."""
+        self.orders.refresh()
+        for settled in self.orders.collect():
+            self._book(settled)
+        if self.orders.unsettled and self._pending_entry is not None:
+            ticket = self._pending_entry[0]
+            held = min(self.broker.positions().get(ticket.option_symbol, 0), ticket.qty)
+            if self.position is None and held > 0:
+                self._open(ticket, held, None)
+            elif self.position is not None and 0 < held != self.position.qty:
+                self._amend(held, self.position.entry_price, "broker position, entry unsettled")
+        return not self.orders.unsettled
+
+    def _book(self, s: Settled) -> None:
+        st = s.status
+        pending = self._pending_entry
+        if s.side == "buy" and pending is not None and pending[1] == s.order_id:
+            ticket, self._pending_entry = pending[0], None
+            filled = min(st.filled_qty, ticket.qty)
+            price = st.avg_price if st.avg_price is not None else ticket.limit
+            if self.position is None and filled > 0:
+                self._open(ticket, filled, price)
+            elif self.position is None:
                 self._skip(ticket.ticker, "not_filled", f"{ticket.option_symbol} (settled late)")
+            elif filled > 0 and (filled, price) != (self.position.qty, self.position.entry_price):
+                self._amend(filled, price, f"entry order {s.order_id} settled")
+        elif s.side == "sell" and self.position is not None and s.order_id in self._exit_oids:
+            filled = min(st.filled_qty, self._remaining())
+            if filled > 0:
+                self._book_sale(s.order_id, filled, st.avg_price, self._last_price)
+        elif st.filled_qty:
+            self._event("warn", f"order {s.order_id} ({s.side} {s.symbol}) settled with "
+                                f"{st.filled_qty} filled and no open trade to book it to")
+
+    def _book_sale(self, order_id: str, qty: int, avg: float | None, fallback: float) -> None:
+        if avg is None:
+            self._event("error", f"order {order_id} filled with no avg price; "
+                                 f"booking at last known {fallback:.4f}")
+            avg = fallback
+        self._sold.append((qty, avg))
 
     # ------------------------------------------------------------------- exit
     def manage_position(self) -> None:
         try:
             self._manage()
+        except (ExitPaused, UnsettledOrderError):
+            pass  # journaled once when the order went unsettled; retried next pass
         except Exception:
             self._error()
 
     def _manage(self) -> None:
-        if self._pending_entry is not None:
-            self._sync_pending_entry()
+        all_settled = self._settle_orders()
         pos = self.position
         if pos is None:
+            return
+        if self._exit_unsettled_seen and self._pending_entry is None and self._held() == 0:
+            self._close()  # the broker no longer holds it: close from booked fills
+            return
+        if not all_settled:
+            return  # no exit decisions while any order is unsettled
+        if self._exit_reason is not None:
+            self.exit_position(self._exit_reason)  # resume an exit that was paused
             return
         bid, ask, ts = self.data.latest_option_quote(pos.option_symbol)
         stock = self.data.latest_stock_price(pos.ticker)
@@ -398,62 +447,57 @@ class Session:
     def _remaining(self) -> int:
         return self.position.qty - sum(q for q, _ in self._sold)
 
-    def _resync_exit(self, price: float) -> int:
-        """Take the broker's held qty as truth; book any unseen sells at `price`."""
-        sym, remaining = self.position.option_symbol, self._remaining()
-        held = self.broker.positions().get(sym, 0)
-        if held < remaining:
-            self._sold.append((remaining - held, price))
-            self._event("warn", f"{sym}: broker shows {remaining - held} more sold; "
-                                f"booked at {price:.4f}")
-        elif held > remaining:
-            self._event("error", f"{sym}: broker holds {held} > tracked {remaining}; selling {remaining}")
-        self._resync_needed = False
-        return self._remaining()
+    def _to_sell(self) -> int:
+        """Qty to sell now; capped at the broker-held qty once an exit order went unsettled."""
+        left = self._remaining()
+        if left > 0 and self._exit_unsettled_seen:
+            left = min(left, self._held())
+        return left
 
-    def _apply_exit_fill(self, fill: Fill, price: float) -> int:
-        """Book an exit fill and return the qty still to sell."""
+    def _record_exit(self, fill: Fill, qty: int, fallback: float) -> None:
+        self._exit_oids.add(fill.order_id)
         if not fill.settled:
-            left = self._resync_exit(fill.avg_price or price)
-            self._resync_needed = True  # the order may still fill: re-read once it settles
-            if left > 0:
-                raise RuntimeError(f"exit paused: order {fill.order_id} unsettled")
-            return 0
-        filled = min(fill.qty, self._remaining())
+            self._exit_unsettled_seen = True
+            raise ExitPaused(f"exit order {fill.order_id} unsettled")
+        filled = min(fill.qty, qty)
         if filled > 0:
-            if fill.avg_price is None:
-                self._event("error", f"order {fill.order_id} filled with no avg price; "
-                                     f"booking at last known {price:.4f}")
-            self._sold.append((filled, fill.avg_price if fill.avg_price is not None else price))
-        return self._remaining()
+            self._book_sale(fill.order_id, filled, fill.avg_price, fallback)
 
     def exit_position(self, reason: ExitReason) -> ClosedTrade:
-        pos = self.position
-        if pos is None or self._trade_id is None:
+        if self.position is None or self._trade_id is None:
             raise RuntimeError("exit_position called with no open position")
-        sym = pos.option_symbol
-        if self._resync_needed:
-            settled = self.orders.refresh()
-            if not self.orders.unsettled:
-                prices = [st.avg_price for st in settled.values() if st.avg_price]
-                self._resync_exit(prices[-1] if prices else self._last_price)
-        remaining = self._remaining()
+        self._exit_reason = self._exit_reason or reason
+        if not self._settle_orders():
+            raise ExitPaused("an order is unsettled; exit resumes once it settles")
+        sym = self.position.option_symbol
         for _ in range(EXIT_LIMIT_ATTEMPTS):
-            if remaining <= 0:
+            qty = self._to_sell()
+            if qty <= 0:
                 break
             bid = self._current_bid(sym)
             if bid <= 0:
                 break
-            fill = self.orders.execute(lambda: self.broker.sell_limit(sym, remaining, bid),
-                                       sym, remaining, EXIT_LIMIT_TIMEOUT)
-            remaining = self._apply_exit_fill(fill, bid)
-        if remaining > 0:
-            fill = self.orders.execute(lambda: self.broker.sell_market(sym, remaining),
-                                       sym, remaining, EXIT_MARKET_TIMEOUT)
-            remaining = self._apply_exit_fill(fill, self._last_price)
-            if remaining > 0:
-                self._event("error", f"exit of {sym} incomplete: {remaining} still held")
-                raise RuntimeError(f"exit of {sym} incomplete: {remaining} still held")
+            fill = self.orders.execute(lambda: self.broker.sell_limit(sym, qty, bid),
+                                       sym, "sell", qty, EXIT_LIMIT_TIMEOUT)
+            self._record_exit(fill, qty, bid)
+        qty = self._to_sell()
+        if qty > 0:
+            fill = self.orders.execute(lambda: self.broker.sell_market(sym, qty),
+                                       sym, "sell", qty, EXIT_MARKET_TIMEOUT)
+            self._record_exit(fill, qty, self._last_price)
+            if self._to_sell() > 0:
+                self._event("error", f"exit of {sym} incomplete: {self._to_sell()} still held")
+                raise RuntimeError(f"exit of {sym} incomplete")
+        return self._close()
+
+    def _close(self) -> ClosedTrade:
+        """Close the open trade from booked exit fills (any unseen remainder at last price)."""
+        sym, left = self.position.option_symbol, self._remaining()
+        if left > 0:
+            self._event("warn", f"{sym}: {left} no longer held but no fill seen; "
+                                f"booked at last known {self._last_price:.4f}")
+            self._sold.append((left, self._last_price))
+        reason = self._exit_reason or "reconciled_missing"
         exit_price = round(sum(q * p for q, p in self._sold) / sum(q for q, _ in self._sold), 4)
         closed = self.journal.close_trade(self._trade_id, exit_price, reason, self.clock.now())
         self._set_position(None, None)
@@ -522,6 +566,8 @@ class Session:
                 if self.position is not None:
                     try:
                         self.exit_position("time")
+                    except (ExitPaused, UnsettledOrderError):
+                        pass  # managed every 15 s until it settles
                     except Exception:
                         self._error()
             elif self._busy() and now >= next_manage:

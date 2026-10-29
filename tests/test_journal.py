@@ -110,15 +110,16 @@ def test_signaled_on_includes_trades_and_tickets_opened_that_day(tmp_path):
     j.close()
 
 
-def test_update_trade_qty_changes_open_trade_and_pnl(tmp_path):
+def test_amend_open_trade_changes_qty_price_and_pnl(tmp_path):
     j = Journal(tmp_path / "j.db")
     tid = j.open_trade(make_pos())
-    j.update_trade_qty(tid, 1)
-    assert j.open_trades()[0][1].qty == 1
+    j.amend_open_trade(tid, 1, 2.40)
+    pos = j.open_trades()[0][1]
+    assert (pos.qty, pos.entry_price) == (1, 2.40)
     closed = j.close_trade(tid, 3.00, "take_profit", datetime(2026, 10, 28, 10, 30, tzinfo=ET))
-    assert closed.pnl == 50.0
+    assert closed.pnl == 60.0
     try:
-        j.update_trade_qty(tid, 2)  # closed trades are immutable
+        j.amend_open_trade(tid, 2, 2.50)  # closed trades are immutable
     except ValueError:
         pass
     else:
