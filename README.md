@@ -69,7 +69,16 @@ In Claude Code, from the project folder, before 9:45 AM ET on a trading day:
 /daytrader:trade-session
 ```
 
-Claude checks `doctor`, starts the engine in the background and watches for tickets. Each ticket shows the ticker, direction, contract, delta, prices, cost (your maximum loss) and exit levels. Claude only approves or rejects after you explicitly answer yes or no for that ticket. Tickets expire after 2 minutes. When you approve, the engine re-quotes and asks again if the price moved more than 5%. Exits then run automatically. At the end you get a report.
+Claude checks `doctor`, starts the engine in the background and watches for tickets. Each ticket shows its id, created time, the ticker, direction, contract, delta, prices, cost (your maximum loss) and exit levels. Claude only approves or rejects the exact ticket you explicitly answered yes or no to; if a newer ticket appears (for example after a price move), Claude asks again. Tickets expire after 2 minutes. When you approve, the engine re-quotes and asks again if the price moved more than 5%. Exits then run automatically. At the end you get a report.
+
+**The engine stops if the Claude Code session closes.** Either keep the session open until 16:05 ET, or have the engine started detached so it keeps running (macOS/Linux):
+
+```
+mkdir -p state
+nohup daytrader run --mode approval > state/approval.log 2>&1 &
+```
+
+and then keep polling (`daytrader pending`, `daytrader status --mode approval`) from Claude or any terminal.
 
 Without Claude, use two terminals:
 

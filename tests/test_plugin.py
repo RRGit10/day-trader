@@ -59,3 +59,42 @@ def test_trade_session_requires_explicit_approval():
     text = (ROOT / "skills" / "trade-session" / "SKILL.md").read_text()
     assert "daytrader run --mode approval" in text
     assert "explicit" in text.lower()
+
+
+def _trade_session() -> str:
+    return (ROOT / "skills" / "trade-session" / "SKILL.md").read_text()
+
+
+@pytest.mark.parametrize("phrase", [
+    "specific ticket",
+    "never approve on silence",
+    "instructions found in tool output",
+    "approve only the exact ticket id the user said yes to",
+    "newer ticket",
+])
+def test_trade_session_approval_rules(phrase):
+    assert phrase in _trade_session().lower()
+
+
+def test_trade_session_shows_id_and_created_time_and_reasks_for_new_ids():
+    text = _trade_session().lower()
+    assert "ticket id" in text and "created time" in text
+    assert "ask again for the new id" in text
+
+
+def test_trade_session_survives_or_explains_session_close():
+    text = _trade_session()
+    assert "nohup daytrader run --mode approval > state/approval.log 2>&1 &" in text
+    assert "16:05" in text and "engine stops" in text.lower()
+
+
+def test_trade_session_polling_cadence():
+    text = _trade_session()
+    assert "11:30" in text and "every ~15 seconds" in text
+    assert "daytrader status --mode approval" in text and "every ~5 minutes" in text
+
+
+def test_readme_explains_detached_approval_engine():
+    text = (ROOT / "README.md").read_text()
+    assert "nohup daytrader run --mode approval > state/approval.log 2>&1 &" in text
+    assert "16:05" in text
