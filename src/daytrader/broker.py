@@ -60,6 +60,9 @@ class AlpacaBroker:
                 f"trading keys ({exc})"
             ) from exc
 
+    def get_account(self):
+        return with_retries(lambda: self._client.get_account())
+
     # Submissions are deliberately not retried: a retried submit could double-order.
     def buy_limit(self, symbol: str, qty: int, limit: float) -> str:
         req = LimitOrderRequest(
