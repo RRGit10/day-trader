@@ -15,7 +15,7 @@ from datetime import datetime, time, timedelta
 from typing import Literal
 
 from .approval import Approver, Ticket
-from .broker import Broker, OrderStatus
+from .broker import Broker
 from .clock import Clock, MarketHours, session_times
 from .config import Settings
 from .contracts import contracts_for_budget, entry_limit_price, pick_contract
@@ -25,6 +25,7 @@ from .guard import may_enter
 from .journal import Journal
 from .models import ET, Bar, ClosedTrade, ExitReason, OptionQuote, OrbResult, Position
 from .orb import evaluate_orb
+from .orders import Fill, Orders
 
 STARTUP_AT = time(9, 25)
 AFFORDABILITY_AT = time(9, 40)
@@ -33,7 +34,6 @@ BAR_RETRY_EVERY = timedelta(seconds=10)
 BAR_RETRY_FOR = timedelta(seconds=60)
 MANAGE_EVERY = timedelta(seconds=15)
 QUOTE_STALE_AFTER = timedelta(seconds=60)
-ORDER_POLL = timedelta(seconds=2)
 ENTRY_TIMEOUT = timedelta(seconds=60)
 EXIT_LIMIT_TIMEOUT = timedelta(seconds=10)
 EXIT_LIMIT_ATTEMPTS = 3
@@ -41,7 +41,6 @@ EXIT_MARKET_TIMEOUT = timedelta(seconds=60)
 REQUOTE_TOLERANCE = 0.05
 SUMMARY_AFTER_CLOSE = timedelta(minutes=5)
 PRIOR_DAY_LOOKBACK = 7
-_TERMINAL = ("filled", "canceled", "rejected")
 
 
 class Session:
@@ -72,9 +71,13 @@ class Session:
         self.signaled: set[tuple[str, str]] = set()
         self.no_new_entries = False
 
+        self.orders = Orders(broker, clock, self._event)
         self.position: Position | None = None
         self._trade_id: int | None = None
+        self._pending_entry: tuple[Ticket, str] | None = None  # entry whose buy is unsettled
         self._sold: list[tuple[int, float]] = []  # exit fills (qty, price) for the open position
+        self._resync_needed = False  # an exit order went unsettled: re-read broker qty first
+        self._last_price = 0.0  # last known option price for the open position
         self._stale_warned = False
 
     # ---------------------------------------------------------------- helpers
@@ -97,29 +100,20 @@ class Session:
     def _day_pnl(self) -> float:
         return round(sum(t.pnl for t in self._trades_today()), 2)
 
+    def _busy(self) -> bool:
+        return self.position is not None or self._pending_entry is not None
+
     def _set_position(self, pos: Position | None, trade_id: int | None) -> None:
         self.position, self._trade_id = pos, trade_id
         self._sold = []
+        self._resync_needed = False
+        self._last_price = pos.entry_price if pos is not None else 0.0
         self._stale_warned = False
 
-    def _settle(self, order_id: str, qty: int, timeout: timedelta) -> OrderStatus:
-        """Poll until filled/terminal or timeout; on timeout cancel, then re-read the status.
-
-        Cancel may raise even when it succeeded, so the re-read status is always what we act on.
-        """
-        deadline = self.clock.now() + timeout
-        while True:
-            st = self.broker.order_status(order_id)
-            if st.filled_qty >= qty or st.status in _TERMINAL:
-                return st
-            if self.clock.now() >= deadline:
-                break
-            self.clock.sleep_until(min(self.clock.now() + ORDER_POLL, deadline))
-        try:
-            self.broker.cancel(order_id)
-        except Exception as exc:
-            self._event("warn", f"cancel {order_id} raised ({exc!r}); re-reading status")
-        return self.broker.order_status(order_id)
+    def _resize(self, qty: int, why: str) -> None:
+        self._event("warn", f"{self.position.option_symbol}: qty {self.position.qty} -> {qty} ({why})")
+        self.position = replace(self.position, qty=qty)
+        self.journal.update_trade_qty(self._trade_id, qty)
 
     # ---------------------------------------------------------------- startup
     def startup(self) -> None:
@@ -132,6 +126,7 @@ class Session:
             self.hours, self.settings.exits, self.settings.strategy
         )
         self._reconcile()
+        self.signaled |= self.journal.signaled_on(self.today)  # restart-safe: one signal a day
         self._load_prior_bars()
 
     def _reconcile(self) -> None:
@@ -147,11 +142,12 @@ class Session:
             if self.position is not None:
                 self._event("warn", f"second open trade {trade_id} {sym} at broker: not managed")
                 continue
-            if held[sym] != pos.qty:
-                self._event("warn", f"{sym}: journal qty {pos.qty} != broker qty {held[sym]}; "
-                                    f"managing {min(pos.qty, held[sym])}")
-                pos = replace(pos, qty=min(pos.qty, held[sym]))
             self._set_position(pos, trade_id)
+            if held[sym] < pos.qty:
+                self._resize(held[sym], "broker holds fewer than the journal")
+            elif held[sym] > pos.qty:
+                self._event("warn", f"{sym}: broker holds {held[sym]} > journal {pos.qty}; "
+                                    f"managing {pos.qty}")
             self._event("info", f"resumed managing trade {trade_id} {sym} x{pos.qty}")
         for sym, qty in held.items():
             if sym not in known:
@@ -240,7 +236,7 @@ class Session:
         deadline = self.clock.now() + BAR_RETRY_FOR
         while missing and self.clock.now() < deadline:
             self.clock.sleep_until(min(self.clock.now() + BAR_RETRY_EVERY, deadline))
-            if self.position is not None:
+            if self._busy():
                 self.manage_position()
             bars.update(fetch(missing))
             missing = [tk for tk in missing if tk not in bars]
@@ -254,7 +250,7 @@ class Session:
         if self.no_new_entries:
             self._skip(tk, "no_new_entries")
             return
-        ok, why = may_enter(self._trades_today(), self.position is not None, self.settings.risk)
+        ok, why = may_enter(self._trades_today(), self._busy(), self.settings.risk)
         if not ok:
             self._skip(tk, str(why))
             return
@@ -276,13 +272,22 @@ class Session:
             if decision != "approved":
                 self._skip(tk, decision, ticket.id)
                 return
-            bid, ask, _ = self.data.latest_option_quote(quote.symbol)
+            bid, ask, ts = self.data.latest_option_quote(quote.symbol)
+            if ask <= 0 or self.clock.now() - ts > QUOTE_STALE_AFTER:
+                self.journal.update_ticket(ticket.id, "stale_quote")
+                self._skip(tk, "stale_quote", f"{quote.symbol} {bid}/{ask} at {ts.isoformat()}")
+                return
             new_limit = entry_limit_price(bid, ask)
             if round(abs(new_limit - ticket.limit) / ticket.limit, 9) <= REQUOTE_TOLERANCE:
                 self.enter(ticket)
                 return
             self.journal.update_ticket(ticket.id, "price_moved")
-            quote = replace(quote, bid=bid, ask=ask)
+            recheck = pick_contract(res.direction, [replace(quote, bid=bid, ask=ask)],
+                                    self.today, self.settings.contract)
+            if recheck.quote is None:
+                self._skip(tk, str(recheck.skip_reason), f"{quote.symbol} re-quoted {bid}/{ask}")
+                return
+            quote = recheck.quote
         self._skip(tk, "price_moved", f"{quote.symbol} re-quoted twice outside 5%")
 
     def _ticket(self, res: OrbResult, quote: OptionQuote) -> Ticket | None:
@@ -306,12 +311,22 @@ class Session:
         )
 
     def enter(self, ticket: Ticket) -> Position | None:
-        order_id = self.broker.buy_limit(ticket.option_symbol, ticket.qty, ticket.limit)
-        st = self._settle(order_id, ticket.qty, ENTRY_TIMEOUT)
-        filled = min(st.filled_qty, ticket.qty)
+        sym = ticket.option_symbol
+        fill = self.orders.execute(
+            lambda: self.broker.buy_limit(sym, ticket.qty, ticket.limit), sym, ticket.qty,
+            ENTRY_TIMEOUT,
+        )
+        if not fill.settled:  # broker positions decide the qty until the order settles
+            self._pending_entry = (ticket, fill.order_id)
+            self._sync_pending_entry()
+            return self.position
+        filled = min(fill.qty, ticket.qty)
         if filled <= 0:
-            self._skip(ticket.ticker, "not_filled", f"{ticket.option_symbol} @ {ticket.limit:.2f}")
+            self._skip(ticket.ticker, "not_filled", f"{sym} @ {ticket.limit:.2f}")
             return None
+        return self._open(ticket, filled, fill.avg_price)
+
+    def _open(self, ticket: Ticket, qty: int, avg_price: float | None) -> Position:
         try:
             stock = self.data.latest_stock_price(ticket.ticker)
         except Exception as exc:
@@ -319,13 +334,27 @@ class Session:
             self._event("warn", f"stock price unavailable after fill ({exc!r}); using trigger close")
         pos = Position(
             ticker=ticket.ticker, direction=ticket.direction, option_symbol=ticket.option_symbol,
-            qty=filled, entry_price=st.avg_price if st.avg_price is not None else ticket.limit,
+            qty=qty, entry_price=avg_price if avg_price is not None else ticket.limit,
             entry_stock_price=stock, range_mid=ticket.stock_stop, opened_at=self.clock.now(),
         )
         self._set_position(pos, self.journal.open_trade(pos))
-        note = "" if filled == ticket.qty else f" (partial: {filled}/{ticket.qty})"
-        self._event("info", f"entered {pos.option_symbol} x{filled} @ {pos.entry_price:.2f}{note}")
+        note = "" if qty == ticket.qty else f" (partial: {qty}/{ticket.qty})"
+        self._event("info", f"entered {pos.option_symbol} x{qty} @ {pos.entry_price:.2f}{note}")
         return pos
+
+    def _sync_pending_entry(self) -> None:
+        ticket, oid = self._pending_entry
+        settled = self.orders.refresh()
+        held = min(self.broker.positions().get(ticket.option_symbol, 0), ticket.qty)
+        st = settled.get(oid)
+        if self.position is None and held > 0:
+            self._open(ticket, held, st.avg_price if st is not None else None)
+        elif self.position is not None and 0 < held != self.position.qty and not self._sold:
+            self._resize(held, "broker position while the entry order was unsettled")
+        if oid not in self.orders.unsettled:
+            self._pending_entry = None
+            if self.position is None:
+                self._skip(ticket.ticker, "not_filled", f"{ticket.option_symbol} (settled late)")
 
     # ------------------------------------------------------------------- exit
     def manage_position(self) -> None:
@@ -335,6 +364,8 @@ class Session:
             self._error()
 
     def _manage(self) -> None:
+        if self._pending_entry is not None:
+            self._sync_pending_entry()
         pos = self.position
         if pos is None:
             return
@@ -348,43 +379,78 @@ class Session:
                 self._stale_warned = True
                 self._event("warn", f"{pos.option_symbol} quote stale since {ts.isoformat()}; "
                                     "using stock-based exits only")
+        if mid is not None:
+            self._last_price = mid
         reason = check_exit(pos, mid, stock, now, self.flat_time, self.settings.exits)
         if reason is not None:
             self.exit_position(reason)
 
     def _current_bid(self, symbol: str) -> float:
         try:
-            return self.data.latest_option_quote(symbol)[0]
+            bid = self.data.latest_option_quote(symbol)[0]
         except Exception as exc:
             self._event("warn", f"{symbol} quote unavailable for exit ({exc!r}); selling at market")
             return 0.0
+        if bid > 0:
+            self._last_price = bid
+        return bid
 
-    def _record_exit_fill(self, st: OrderStatus, remaining: int, fallback: float) -> int:
-        filled = min(st.filled_qty, remaining)
+    def _remaining(self) -> int:
+        return self.position.qty - sum(q for q, _ in self._sold)
+
+    def _resync_exit(self, price: float) -> int:
+        """Take the broker's held qty as truth; book any unseen sells at `price`."""
+        sym, remaining = self.position.option_symbol, self._remaining()
+        held = self.broker.positions().get(sym, 0)
+        if held < remaining:
+            self._sold.append((remaining - held, price))
+            self._event("warn", f"{sym}: broker shows {remaining - held} more sold; "
+                                f"booked at {price:.4f}")
+        elif held > remaining:
+            self._event("error", f"{sym}: broker holds {held} > tracked {remaining}; selling {remaining}")
+        self._resync_needed = False
+        return self._remaining()
+
+    def _apply_exit_fill(self, fill: Fill, price: float) -> int:
+        """Book an exit fill and return the qty still to sell."""
+        if not fill.settled:
+            left = self._resync_exit(fill.avg_price or price)
+            self._resync_needed = True  # the order may still fill: re-read once it settles
+            if left > 0:
+                raise RuntimeError(f"exit paused: order {fill.order_id} unsettled")
+            return 0
+        filled = min(fill.qty, self._remaining())
         if filled > 0:
-            self._sold.append((filled, st.avg_price if st.avg_price is not None else fallback))
-        return filled
+            if fill.avg_price is None:
+                self._event("error", f"order {fill.order_id} filled with no avg price; "
+                                     f"booking at last known {price:.4f}")
+            self._sold.append((filled, fill.avg_price if fill.avg_price is not None else price))
+        return self._remaining()
 
     def exit_position(self, reason: ExitReason) -> ClosedTrade:
         pos = self.position
         if pos is None or self._trade_id is None:
             raise RuntimeError("exit_position called with no open position")
         sym = pos.option_symbol
-        remaining = pos.qty - sum(q for q, _ in self._sold)
-        bid = 0.0
+        if self._resync_needed:
+            settled = self.orders.refresh()
+            if not self.orders.unsettled:
+                prices = [st.avg_price for st in settled.values() if st.avg_price]
+                self._resync_exit(prices[-1] if prices else self._last_price)
+        remaining = self._remaining()
         for _ in range(EXIT_LIMIT_ATTEMPTS):
             if remaining <= 0:
                 break
             bid = self._current_bid(sym)
             if bid <= 0:
                 break
-            st = self._settle(self.broker.sell_limit(sym, remaining, bid), remaining,
-                              EXIT_LIMIT_TIMEOUT)
-            remaining -= self._record_exit_fill(st, remaining, bid)
+            fill = self.orders.execute(lambda: self.broker.sell_limit(sym, remaining, bid),
+                                       sym, remaining, EXIT_LIMIT_TIMEOUT)
+            remaining = self._apply_exit_fill(fill, bid)
         if remaining > 0:
-            st = self._settle(self.broker.sell_market(sym, remaining), remaining,
-                              EXIT_MARKET_TIMEOUT)
-            remaining -= self._record_exit_fill(st, remaining, bid)
+            fill = self.orders.execute(lambda: self.broker.sell_market(sym, remaining),
+                                       sym, remaining, EXIT_MARKET_TIMEOUT)
+            remaining = self._apply_exit_fill(fill, self._last_price)
             if remaining > 0:
                 self._event("error", f"exit of {sym} incomplete: {remaining} still held")
                 raise RuntimeError(f"exit of {sym} incomplete: {remaining} still held")
@@ -458,7 +524,7 @@ class Session:
                         self.exit_position("time")
                     except Exception:
                         self._error()
-            elif self.position is not None and now >= next_manage:
+            elif self._busy() and now >= next_manage:
                 self.manage_position()
                 next_manage = self.clock.now() + MANAGE_EVERY
             else:
@@ -469,6 +535,6 @@ class Session:
                     events.append(pending[0] + BAR_FETCH_DELAY)
                 if not flattened:
                     events.append(flat_at)
-                if self.position is not None:
+                if self._busy():
                     events.append(next_manage)
                 self.clock.sleep_until(min(events))

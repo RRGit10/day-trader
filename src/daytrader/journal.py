@@ -120,6 +120,27 @@ class Journal:
         )
         return ClosedTrade(ticker=ticker, pnl=pnl, closed_at=closed_at, reason=reason)
 
+    def update_trade_qty(self, trade_id: int, qty: int) -> None:
+        cur = self._write(
+            "UPDATE trades SET qty=? WHERE id=? AND closed_at IS NULL", (qty, trade_id)
+        )
+        if cur.rowcount != 1:
+            raise ValueError(f"no open trade with id {trade_id}")
+
+    def signaled_on(self, day: date) -> set[tuple[str, str]]:
+        """(ticker, direction) pairs with a trade opened or a ticket created on `day`."""
+        out: set[tuple[str, str]] = set()
+        for ticker, direction, opened in self._conn.execute(
+            "SELECT ticker, direction, opened_at FROM trades"
+        ):
+            if _parse(opened).date() == day:
+                out.add((ticker, direction))
+        for ts, payload in self._conn.execute("SELECT ts, payload FROM tickets"):
+            if _parse(ts).date() == day:
+                p = json.loads(payload)
+                out.add((p["ticker"], p["direction"]))
+        return out
+
     def open_trades(self) -> list[tuple[int, Position]]:
         rows = self._conn.execute(
             "SELECT id, ticker, direction, option_symbol, qty, entry_price, entry_stock_price,"

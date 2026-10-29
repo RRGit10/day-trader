@@ -21,3 +21,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "tests"]
+filterwarnings = [
+    # third-party: alpaca-py imports websockets.legacy, deprecated upstream
+    "ignore:websockets.legacy is deprecated:DeprecationWarning",
+]

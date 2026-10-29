@@ -289,7 +289,7 @@ def test_cancel_exception_still_reads_filled_qty(env):
 
 def test_fill_racing_the_cancel_is_kept(env):
     env.broker.fill_policy = "never"
-    env.broker.fill_on_cancel = True
+    env.broker.fill_during_cancel = True
     pos = _enter_aaa(env)
     assert pos.qty == 2
     assert env.broker.positions() == {"AAAC": 2}
@@ -534,3 +534,183 @@ def test_run_day_market_closed_returns_early(tmp_path):
     assert e.clock.now() == at(9, 25)
     assert e.broker.orders == []
     e.journal.close()
+
+
+# ---------------------------------------------------------------- review round 1
+def _sells(e: Env) -> list[dict]:
+    return [o for o in e.broker.orders if o["side"] == "sell"]
+
+
+def test_entry_cancel_is_async_and_fill_during_cancel_is_kept(env):
+    env.broker.fill_policy = "never"
+    env.broker.cancel_delay_reads = 3  # still "new" for 3 reads after cancel, then fills
+    env.broker.fill_during_cancel = True
+    pos = _enter_aaa(env)
+    assert pos.qty == 2
+    assert env.broker.positions() == {"AAAC": 2}
+    assert env.trade_rows()[0][1] == 2
+
+
+def test_entry_order_stuck_after_cancel_uses_broker_positions(env):
+    env.broker.fill_policy = "never"
+    env.broker.cancel_delay_reads = 10_000  # never settles on its own
+    env.add("AAA")
+    env.open_day()
+    env.session.on_bar_close(at(9, 55))
+    assert env.session.position is None
+    assert any("o1" in m for _, m in env.events("error"))
+    assert env.clock.now() >= at(9, 55, 5) + timedelta(seconds=60 + 20)
+
+    env.broker.force_fill("o1")  # the "cancelled" buy fills after all
+    env.clock.advance(15)
+    env.session.manage_position()
+    pos = env.session.position
+    assert pos is not None and pos.qty == 2
+    assert env.trade_rows()[0][1] == 2
+
+
+def test_entry_status_failure_tracks_order_and_uses_broker_positions(tmp_path):
+    e = Env(tmp_path, tickers=("AAA", "BBB"))
+    e.add("AAA", "long", time(9, 55))
+    e.add("BBB", "long", time(10, 0))
+    e.broker.fill_policy = "partial"  # 1 of 2 fills
+    e.broker.status_fails = True
+    e.open_day()
+    e.session.on_bar_close(at(9, 55))
+    assert e.broker.cancels == ["o1"]  # the live order was cancelled, not abandoned
+    assert e.session.position is not None and e.session.position.qty == 1
+    assert e.events("error")
+
+    e.broker.status_fails = False
+    e.session.on_bar_close(at(10, 0))
+    assert ("BBB", "position_open") in e.skips()
+    e.broker.fill_policy = "fill"
+    e.data.set_quote("AAAC", 3.00, 3.10)
+    e.clock.advance(15)
+    e.session.manage_position()
+    assert [o["qty"] for o in _sells(e)] == [1]
+    assert e.trade_rows()[0][1:] == (1, 2.50, 3.00, 50.0, "take_profit")
+    e.journal.close()
+
+
+def test_exit_cancel_is_async_and_fill_during_cancel_is_counted(env):
+    _enter_aaa(env)
+    env.broker.fill_policy = "never"
+    env.broker.cancel_delay_reads = 3
+    env.broker.fill_during_cancel = True
+    _stop_out(env, "AAA")
+    assert env.session.position is None
+    assert [(o["type"], o["qty"]) for o in _sells(env)] == [("limit", 2)]
+    assert env.trade_rows()[0][3:] == (2.20, -60.0, "stop_loss")
+    assert env.broker.positions() == {}
+
+
+def test_exit_order_stuck_after_cancel_never_oversells(env):
+    _enter_aaa(env)
+    env.broker.fill_policy = "never"
+    env.broker.cancel_delay_reads = 10_000
+    _stop_out(env, "AAA")
+    assert env.session.position is not None
+    assert len(_sells(env)) == 1
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert len(_sells(env)) == 1  # no new sell while o2 is unsettled
+
+    env.broker.force_fill("o2")
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert env.session.position is None
+    assert len(_sells(env)) == 1
+    assert env.broker.positions() == {}
+    assert env.trade_rows()[0][3:] == (2.20, -60.0, "stop_loss")
+
+
+def test_exit_status_failure_never_oversells(env):
+    _enter_aaa(env)
+    env.broker.fill_policy = "never"
+    env.broker.status_fails = True
+    _stop_out(env, "AAA")
+    assert env.session.position is not None
+    assert env.broker.cancels == ["o2"]
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert len(_sells(env)) == 1
+
+    env.broker.status_fails = False
+    env.broker.fill_policy = "fill"
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert env.session.position is None
+    assert [o["qty"] for o in _sells(env)] == [2, 2]
+    assert env.broker.positions() == {}
+
+
+def test_restart_does_not_resignal_today(tmp_path):
+    e = Env(tmp_path)
+    e.add("AAA", "long", time(9, 55))
+    e.open_day()
+    e.session.on_bar_close(at(9, 55))
+    _stop_out(e, "AAA")
+
+    restarted = Session("bot", e.settings, e.data, e.broker, e.journal, e.approver, e.clock)
+    restarted.startup()
+    restarted.affordability_filter()
+    restarted.on_bar_close(at(10, 0))  # AAA long still "triggers" bar after bar
+    assert sum(1 for o in e.broker.orders if o["side"] == "buy") == 1
+    assert len(e.approver.tickets) == 1
+    e.journal.close()
+
+
+def test_reconcile_qty_mismatch_corrects_journal_qty(env):
+    env.add("AAA")
+    _journal_position(env, qty=2)
+    env.broker._positions["AAAC"] = 1
+    env.session.startup()
+    assert env.journal.open_trades()[0][1].qty == 1
+    env.data.set_quote("AAAC", 3.00, 3.10)
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert env.trade_rows()[0][1:] == (1, 2.50, 3.00, 50.0, "take_profit")
+
+
+@pytest.mark.parametrize("bid,ask,reason", [(5.40, 5.60, "too_expensive"),
+                                            (2.60, 3.20, "illiquid")])
+def test_reask_rechecks_contract_filters(tmp_path, bid, ask, reason):
+    e = Env(tmp_path, mode="approval", approver=ScriptedApprover(
+        on_request=lambda t: e.data.set_quote("AAAC", bid, ask)))
+    e.add("AAA")
+    e.open_day()
+    e.session.on_bar_close(at(9, 55))
+    assert len(e.approver.tickets) == 1
+    assert ("AAA", reason) in e.skips()
+    assert e.broker.orders == []
+    e.journal.close()
+
+
+@pytest.mark.parametrize("stale", [True, False])
+def test_stale_or_empty_requote_skips(tmp_path, stale):
+    def on_request(t):
+        if stale:
+            e.data.set_quote("AAAC", 2.45, 2.55, ts=e.clock.now() - timedelta(seconds=61))
+        else:
+            e.data.set_quote("AAAC", 0.0, 0.0)
+
+    e = Env(tmp_path, mode="approval", approver=ScriptedApprover(on_request=on_request))
+    e.add("AAA")
+    e.open_day()
+    e.session.on_bar_close(at(9, 55))
+    assert ("AAA", "stale_quote") in e.skips()
+    assert e.broker.orders == []
+    assert e.ticket_statuses() == ["stale_quote"]
+    e.journal.close()
+
+
+def test_market_fill_without_avg_price_uses_last_known_price(env):
+    _enter_aaa(env)
+    env.broker.market_price["AAAC"] = None  # broker reports a fill with no avg price
+    env.data.set_quote("AAAC", 0.0, 0.10)  # mid 0.05; zero bid -> straight to market
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert [o["type"] for o in _sells(env)] == ["market"]
+    assert env.trade_rows()[0][3] == 0.05
+    assert any("avg" in m for _, m in env.events("error"))

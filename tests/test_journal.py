@@ -93,3 +93,34 @@ def test_skips_tickets_events_and_reopen(tmp_path):
     assert status == "approved"
     assert j2._conn.execute("SELECT message FROM events").fetchone()[0] == "hello"
     j2.close()
+
+
+def test_signaled_on_includes_trades_and_tickets_opened_that_day(tmp_path):
+    j = Journal(tmp_path / "j.db")
+    day = date(2026, 10, 28)
+    j.open_trade(make_pos(ticker="AAPL"))  # still open, opened today
+    tid = j.open_trade(make_pos(ticker="MSFT"))
+    j.close_trade(tid, 2.0, "stop_loss", datetime(2026, 10, 28, 10, 30, tzinfo=ET))
+    j.open_trade(make_pos(opened=datetime(2026, 10, 27, 10, 5, tzinfo=ET), ticker="OLD"))
+    j.record_ticket("t1", datetime(2026, 10, 28, 9, 55, tzinfo=ET),
+                    {"ticker": "SPY", "direction": "short"}, "rejected")
+    j.record_ticket("t2", datetime(2026, 10, 27, 9, 55, tzinfo=ET),
+                    {"ticker": "QQQ", "direction": "long"}, "approved")
+    assert j.signaled_on(day) == {("AAPL", "long"), ("MSFT", "long"), ("SPY", "short")}
+    j.close()
+
+
+def test_update_trade_qty_changes_open_trade_and_pnl(tmp_path):
+    j = Journal(tmp_path / "j.db")
+    tid = j.open_trade(make_pos())
+    j.update_trade_qty(tid, 1)
+    assert j.open_trades()[0][1].qty == 1
+    closed = j.close_trade(tid, 3.00, "take_profit", datetime(2026, 10, 28, 10, 30, tzinfo=ET))
+    assert closed.pnl == 50.0
+    try:
+        j.update_trade_qty(tid, 2)  # closed trades are immutable
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")
+    j.close()

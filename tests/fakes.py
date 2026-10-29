@@ -60,18 +60,30 @@ class FakeBroker:
     """In-memory Broker. fill_policy: "fill" | "partial" | "never" (may change between calls).
 
     market_fill_policy, if set, applies to market orders instead of fill_policy.
+    Cancels are asynchronous like Alpaca's: with cancel_delay_reads = N the order still
+    reports "new" for N status reads after cancel, then becomes "canceled" (or "filled"
+    when fill_during_cancel). status_fails makes order_status raise.
     """
 
     def __init__(self, fill_policy: str = "fill", market_fill_policy: str | None = None) -> None:
         self.fill_policy = fill_policy
-        self.market_fill_policy = market_fill_policy  # overrides fill_policy for market orders
+        self.market_fill_policy = market_fill_policy
         self.cancel_raises = False  # cancel succeeds, then raises (like a lost response)
-        self.fill_on_cancel = False  # the order fills completely in a race with the cancel
+        self.cancel_delay_reads = 0
+        self.fill_during_cancel = False  # the rest of the order fills while the cancel is pending
+        self.status_fails = False
         self.cancels: list[str] = []
         self.orders: list[dict] = []
         self.market_price: dict[str, float] = {}
         self._state: dict[str, dict] = {}
         self._positions: dict[str, int] = {}
+
+    def _move(self, side: str, symbol: str, qty: int) -> None:
+        left = self._positions.get(symbol, 0) + (qty if side == "buy" else -qty)
+        if left:
+            self._positions[symbol] = left
+        else:
+            self._positions.pop(symbol, None)
 
     def _place(self, side: str, symbol: str, qty: int, limit: float | None, type_: str) -> str:
         oid = f"o{len(self.orders) + 1}"
@@ -89,16 +101,12 @@ class FakeBroker:
         else:  # "never", or a 1-lot under "partial"
             filled, status = 0, "new"
         self._state[oid] = {
-            "status": status, "filled": filled,
+            "status": status, "filled": filled, "qty": qty, "fill_price": price,
             "price": price if filled else None, "side": side, "symbol": symbol,
+            "cancel_reads": None,
         }
-        delta = filled if side == "buy" else -filled
-        if delta:
-            left = self._positions.get(symbol, 0) + delta
-            if left:
-                self._positions[symbol] = left
-            else:
-                self._positions.pop(symbol, None)
+        if filled:
+            self._move(side, symbol, filled)
         return oid
 
     def buy_limit(self, symbol: str, qty: int, limit: float) -> str:
@@ -110,26 +118,46 @@ class FakeBroker:
     def sell_market(self, symbol: str, qty: int) -> str:
         return self._place("sell", symbol, qty, None, "market")
 
+    def force_fill(self, order_id: str) -> None:
+        """The rest of a live order fills now (e.g. while its cancel is still pending)."""
+        s = self._state[order_id]
+        more = s["qty"] - s["filled"]
+        if more:
+            self._move(s["side"], s["symbol"], more)
+        s.update(status="filled", filled=s["qty"], price=s["fill_price"], cancel_reads=None)
+
+    def _finish_cancel(self, s: dict) -> None:
+        s["cancel_reads"] = None
+        if self.fill_during_cancel:
+            more = s["qty"] - s["filled"]
+            if more:
+                self._move(s["side"], s["symbol"], more)
+            s.update(status="filled", filled=s["qty"], price=s["fill_price"])
+        else:
+            s["status"] = "canceled"
+
     def cancel(self, order_id: str) -> None:
         self.cancels.append(order_id)
         s = self._state[order_id]
-        if self.fill_on_cancel and s["status"] in ("new", "partially_filled"):
-            o = self.orders[int(order_id[1:]) - 1]
-            more = o["qty"] - s["filled"]
-            s.update(status="filled", filled=o["qty"], price=o["limit"] or s["price"])
-            sign = 1 if s["side"] == "buy" else -1
-            self._positions[s["symbol"]] = self._positions.get(s["symbol"], 0) + sign * more
-            if not self._positions[s["symbol"]]:
-                del self._positions[s["symbol"]]
-            return
-        s["status"] = "canceled"
+        if s["status"] in ("new", "partially_filled") and s["cancel_reads"] is None:
+            if self.cancel_delay_reads:
+                s["cancel_reads"] = self.cancel_delay_reads
+            else:
+                self._finish_cancel(s)
         if self.cancel_raises:
             raise RuntimeError("cancel response lost")
 
     def order_status(self, order_id: str):
         from daytrader.broker import OrderStatus
 
+        if self.status_fails:
+            raise RuntimeError("order status unavailable")
         s = self._state[order_id]
+        if s["cancel_reads"] is not None:
+            if s["cancel_reads"] > 0:
+                s["cancel_reads"] -= 1
+            else:
+                self._finish_cancel(s)
         return OrderStatus(s["status"], s["filled"], s["price"])
 
     def positions(self) -> dict[str, int]:
