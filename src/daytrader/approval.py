@@ -131,6 +131,12 @@ def _write_atomic(path: Path, payload: dict) -> None:
         raise
 
 
+def _valid_id(ticket_id: str) -> bool:
+    return bool(ticket_id) and ".." not in ticket_id and not any(
+        c in ticket_id for c in ("/", "\\", "\0")
+    )
+
+
 def _dirs(state_dir: Path) -> tuple[Path, Path, Path]:
     base = Path(state_dir) / "approval"
     return base / "pending", base / "decisions", base / "expired"
@@ -152,11 +158,14 @@ class FileApprover:
         self.on_poll = on_poll
 
     def request(self, ticket: Ticket) -> Decision:
+        if not _valid_id(ticket.id):
+            raise ValueError(f"invalid ticket id: {ticket.id!r}")
         pending_dir, decisions_dir, expired_dir = _dirs(self.state_dir)
         for d in (pending_dir, decisions_dir, expired_dir):
             d.mkdir(parents=True, exist_ok=True)
         pending = pending_dir / f"{ticket.id}.json"
         decision_file = decisions_dir / f"{ticket.id}.json"
+        decision_file.unlink(missing_ok=True)  # never honor a stale decision
         _write_atomic(pending, ticket.to_dict())
         deadline = self.clock.now() + timedelta(seconds=self.timeout_s)
         try:
@@ -170,6 +179,7 @@ class FileApprover:
                 if self.clock.now() >= deadline:
                     # Move out of pending first so write_decision can no longer match it.
                     os.replace(pending, expired_dir / pending.name)
+                    decision_file.unlink(missing_ok=True)
                     return "expired"
                 self.clock.sleep_until(self.clock.now() + timedelta(seconds=self.poll_s))
         finally:
@@ -185,6 +195,8 @@ class FileApprover:
 
 
 def write_decision(state_dir: Path, ticket_id: str, decision: str) -> bool:
+    if not _valid_id(ticket_id):
+        return False
     pending_dir, decisions_dir, _ = _dirs(state_dir)
     if not (pending_dir / f"{ticket_id}.json").exists():
         return False

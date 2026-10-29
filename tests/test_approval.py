@@ -105,3 +105,21 @@ def test_decision_after_expiry_ignored(tmp_path):
     assert write_decision(tmp_path, "t1", "approve") is False
     assert (tmp_path / "approval/expired/t1.json").exists()
     assert not (tmp_path / "approval/decisions/t1.json").exists()
+
+
+def test_stale_decision_not_honored(tmp_path):
+    d = tmp_path / "approval/decisions"
+    d.mkdir(parents=True)
+    (d / "t1.json").write_text('{"decision": "approve"}')
+    a = FileApprover(tmp_path, FakeClock(T0))
+    assert a.request(make_ticket()) == "expired"
+    assert not (d / "t1.json").exists()
+
+
+def test_bad_ticket_ids(tmp_path):
+    import pytest
+
+    for bad in ("../x", "a/b", "a\\b", ".."):
+        assert write_decision(tmp_path, bad, "approve") is False
+        with pytest.raises(ValueError):
+            FileApprover(tmp_path, FakeClock(T0)).request(make_ticket(bad))
