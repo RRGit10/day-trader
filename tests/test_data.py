@@ -109,3 +109,15 @@ def test_fake_data_bars_filter():
     f.bars["A"] = [Bar(t0 + timedelta(minutes=5 * i), 1, 1, 1, 1, 1) for i in range(4)]
     out = f.bars_5min(["A", "B"], t0 + timedelta(minutes=5), t0 + timedelta(minutes=15))
     assert [b.t.minute for b in out["A"]] == [35, 40] and "B" not in out
+
+
+def test_latest_prices_missing_symbol_raises_data_error():
+    from daytrader.data import DataError
+
+    d = make_data()
+    d._stock.get_stock_latest_trade.return_value = {}
+    with pytest.raises(DataError, match="no quote for AAPL"):
+        d.latest_stock_price("AAPL")
+    d._option.get_option_latest_quote.return_value = {}
+    with pytest.raises(DataError, match="no quote for X"):
+        d.latest_option_quote("X")

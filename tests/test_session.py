@@ -357,7 +357,9 @@ def test_reconcile_missing_broker_position(env):
     assert any("ZZZC" in m for _, m in env.events("warn"))
 
 
-def test_exception_stops_new_entries_but_manages_exits(tmp_path):
+def test_exception_stops_new_entries_but_manages_exits(tmp_path, monkeypatch):
+    import daytrader.session as session_mod
+
     e = Env(tmp_path, tickers=("AAA", "BBB"))
     e.add("AAA", "long", time(9, 55))
     e.add("BBB", "long", time(10, 5))
@@ -365,13 +367,18 @@ def test_exception_stops_new_entries_but_manages_exits(tmp_path):
     e.session.on_bar_close(at(9, 55))
     assert e.session.position is not None
 
-    e.data.fail["bars_5min"] = RuntimeError("boom")
+    real = session_mod.evaluate_orb
+
+    def buggy(*a, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(session_mod, "evaluate_orb", buggy)  # a bug, not a data error
     e.session.on_bar_close(at(10, 0))  # must not raise
     assert e.session.no_new_entries
     errors = e.events("error")
     assert len(errors) == 1 and "boom" in errors[0][1] and "Traceback" in errors[0][1]
 
-    del e.data.fail["bars_5min"]
+    monkeypatch.setattr(session_mod, "evaluate_orb", real)
     e.data.set_quote("AAAC", 3.00, 3.10)
     e.clock.advance(15)
     e.session.manage_position()
@@ -383,13 +390,203 @@ def test_exception_stops_new_entries_but_manages_exits(tmp_path):
     assert sum(1 for o in e.broker.orders if o["side"] == "buy") == 1
 
 
-def test_manage_exception_is_journaled(env):
+def test_option_quote_failure_is_treated_as_stale(env):
     _enter_aaa(env)
     env.data.fail["latest_option_quote"] = RuntimeError("quote down")
+    env.clock.advance(15)
     env.session.manage_position()  # must not raise
-    assert env.session.no_new_entries
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert not env.session.no_new_entries
     assert env.session.position is not None
-    assert len(env.events("error")) == 1
+    assert env.events("error") == []
+    assert len(env.events("warn")) == 1  # warned once
+
+    env.data.stock_prices["AAA"] = 100.0  # stock-based exits still work
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert env.trade_rows()[0][5] == "stock_stop"
+
+
+def test_stock_price_failure_waits_for_next_pass(env):
+    _enter_aaa(env)
+    env.data.fail["latest_stock_price"] = RuntimeError("trade feed down")
+    env.data.set_quote("AAAC", 3.00, 3.10)  # take profit, but no stock price this pass
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert env.session.position is not None
+    assert not env.session.no_new_entries
+    assert env.events("error") == []
+    assert any("trade feed down" in m for _, m in env.events("warn"))
+
+    del env.data.fail["latest_stock_price"]
+    env.clock.advance(15)
+    env.session.manage_position()
+    assert env.trade_rows()[0][5] == "take_profit"
+
+
+class FlakyBars(LiveFakeData):
+    """bars_5min raises for the first `fails` calls after the warm-up fetch."""
+
+    fails = 0
+
+    def bars_5min(self, tickers, start, end):
+        if len(self.bar_calls) >= 1 and self.fails > 0:
+            self.fails -= 1
+            self.bar_calls.append((list(tickers), self.clock.now()))
+            raise RuntimeError("bars timeout")
+        return super().bars_5min(tickers, start, end)
+
+
+def test_bars_error_is_retried_like_a_missing_bar(tmp_path):
+    e = Env(tmp_path, data_cls=FlakyBars)
+    e.add("AAA")
+    e.open_day()
+    e.data.fails = 2
+    e.session.on_bar_close(at(9, 55))
+    assert e.session.position is not None  # third fetch at 09:55:25 succeeded
+    assert [ts for _, ts in e.data.bar_calls[1:]] == [at(9, 55, 5), at(9, 55, 15), at(9, 55, 25)]
+    assert not e.session.no_new_entries
+    assert e.events("error") == []
+    e.journal.close()
+
+
+def test_bars_error_for_60s_skips_candle_not_day(tmp_path):
+    e = Env(tmp_path, tickers=("AAA", "BBB"), data_cls=FlakyBars)
+    e.add("AAA", "long", time(9, 55))
+    e.add("BBB", "long", time(10, 0))
+    e.open_day()
+    e.data.fails = 7  # the 09:55 fetch and all six retries
+    e.session.on_bar_close(at(9, 55))
+    assert set(e.skips()) == {("AAA", "no_bars"), ("BBB", "no_bars")}
+    assert not e.session.no_new_entries
+    e.session.on_bar_close(at(10, 0))
+    assert e.session.position is not None and e.session.position.ticker == "AAA"
+    e.journal.close()
+
+
+def test_chain_error_skips_ticker_not_day(tmp_path):
+    e = Env(tmp_path, tickers=("AAA", "BBB"))
+    e.add("AAA", "long", time(9, 55))
+    e.add("BBB", "long", time(10, 0))
+    e.open_day()
+    e.data.fail["option_chain"] = RuntimeError("chain timeout")
+    e.session.on_bar_close(at(9, 55))
+    assert ("AAA", "chain_error") in e.skips()
+    assert not e.session.no_new_entries
+    del e.data.fail["option_chain"]
+    e.session.on_bar_close(at(10, 0))
+    assert e.session.position is not None and e.session.position.ticker == "BBB"
+    e.journal.close()
+
+
+def test_requote_error_after_approval_skips_as_stale(tmp_path):
+    def on_request(t):
+        e.data.fail["latest_option_quote"] = RuntimeError("quote timeout")
+
+    e = Env(tmp_path, mode="approval", approver=ScriptedApprover(on_request=on_request))
+    e.add("AAA")
+    e.open_day()
+    e.session.on_bar_close(at(9, 55))
+    assert ("AAA", "stale_quote") in e.skips()
+    assert e.broker.orders == [] and not e.session.no_new_entries
+    e.journal.close()
+
+
+def test_position_stock_levels_match_the_ticket(env):
+    env.add("AAA")
+    env.data.stock_prices["AAA"] = 150.0  # post-fill stock price must not be used
+    env.open_day()
+    env.session.on_bar_close(at(9, 55))
+    ticket, pos = env.approver.tickets[0], env.session.position
+    assert pos.entry_stock_price == 103.0  # the trigger close
+    assert ticket.stock_target == pos.stock_target
+    assert ticket.stock_stop == pos.range_mid
+
+
+def test_empty_scan_list_skips_bars_call(env):
+    env.add("AAA")
+    env.data.chains[("AAA", "call")] = [quote("AAA", "call", 5.40, 5.60)]
+    env.data.chains[("AAA", "put")] = [quote("AAA", "put", 5.40, 5.60)]
+    env.open_day()
+    calls = len(env.data.bar_calls)
+    env.session.on_bar_close(at(9, 55))
+    env.session.on_bar_close(at(10, 0))
+    assert len(env.data.bar_calls) == calls
+    infos = [m for _, m in env.events("info") if "affordability" in m]
+    assert infos == ["no tickers passed the affordability filter"]
+
+
+def test_previous_bar_missing_is_no_bars(tmp_path):
+    e = Env(tmp_path)
+    e.add("AAA")
+    e.data.bars["AAA"] = [b for b in e.data.bars["AAA"] if b.t != at(9, 45)]
+    e.open_day()
+    e.session.on_bar_close(at(9, 55))
+    assert e.skips() == [("AAA", "no_bars")]
+    assert e.journal.check_rows() == []
+    e.journal.close()
+
+
+class FlakyChain(LiveFakeData):
+    """option_chain raises before 09:44 for tickers in `flaky`; counts calls per ticker."""
+
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.flaky: set[str] = set()
+        self.chain_calls: dict[str, int] = {}
+
+    def option_chain(self, underlying, kind, today):
+        self.chain_calls[underlying] = self.chain_calls.get(underlying, 0) + 1
+        if underlying in self.flaky and self.clock.now() < at(9, 44):
+            raise RuntimeError("chain timeout")
+        return super().option_chain(underlying, kind, today)
+
+
+def test_affordability_error_retried_once_at_0944(tmp_path):
+    e = Env(tmp_path, tickers=("AAA", "BBB", "CCC"), data_cls=FlakyChain, start=at(9, 0),
+            close=at(10, 30))
+    e.add("AAA", "long", time(10, 5))
+    e.add("BBB", "long", time(9, 55))
+    e.add("CCC")
+    e.data.chains[("CCC", "call")] = [quote("CCC", "call", 5.40, 5.60)]  # too expensive
+    e.data.chains[("CCC", "put")] = [quote("CCC", "put", 5.40, 5.60)]
+    e.data.flaky = {"AAA", "CCC"}
+    e.session.run_day()
+    assert e.session.scan_list == ["AAA", "BBB"]  # config order kept
+    assert ("CCC", "too_expensive") in e.skips()
+    assert ("AAA", "chain_error") not in e.skips()
+    assert e.data.chain_calls["BBB"] == 1 + 1  # 09:40 call check + BBB's entry chain
+    assert "AAA" in [tk for _, tk, _, _ in e.journal.check_rows()]
+    e.journal.close()
+
+
+def _beats(e: Env) -> list[datetime]:
+    seen: list[datetime] = []
+    real = e.session.write_heartbeat
+
+    def spy():
+        seen.append(e.clock.now())
+        real()
+
+    e.session.write_heartbeat = spy
+    return seen
+
+
+@pytest.mark.parametrize("fill_policy", ["fill", "never"])
+def test_heartbeat_at_least_every_15s(tmp_path, fill_policy):
+    e = Env(tmp_path, tickers=("AAA", "BBB"), data_cls=DayData, start=at(9, 0))
+    e.add("AAA", "long", time(9, 55))
+    e.add("BBB", "short", time(10, 40))
+    e.data.bars["BBB"] = [b for b in e.data.bars["BBB"] if b.t != at(10, 15)]  # 60 s retry
+    e.broker.fill_policy = fill_policy  # "never": 60 s entry wait + cancel
+    seen = _beats(e)
+    e.session.run_day()
+    day = [t for t in seen if t >= at(9, 25)]
+    assert day[0] == at(9, 25) and day[-1] == at(16, 5)
+    gaps = [(b - a).total_seconds() for a, b in zip(day, day[1:])]
+    assert max(gaps) <= 15
+    e.journal.close()
 
 
 def test_affordability_filter_drops_expensive_tickers(tmp_path):

@@ -25,6 +25,10 @@ from .models import ET, Bar, OptionQuote, OptionType
 T = TypeVar("T")
 
 
+class DataError(Exception):
+    """The data API answered but without the data asked for (e.g. no latest quote)."""
+
+
 def with_retries(
     fn: Callable[[], T],
     tries: int = 3,
@@ -154,9 +158,14 @@ class AlpacaData:
 
     def latest_stock_price(self, ticker: str) -> float:
         req = StockLatestTradeRequest(symbol_or_symbols=ticker, feed=DataFeed.IEX)
-        return float(with_retries(lambda: self._stock.get_stock_latest_trade(req))[ticker].price)
+        trade = with_retries(lambda: self._stock.get_stock_latest_trade(req)).get(ticker)
+        if trade is None:
+            raise DataError(f"no quote for {ticker}")
+        return float(trade.price)
 
     def latest_option_quote(self, symbol: str) -> tuple[float, float, datetime]:
         req = OptionLatestQuoteRequest(symbol_or_symbols=symbol, feed=OptionsFeed.INDICATIVE)
-        q = with_retries(lambda: self._option.get_option_latest_quote(req))[symbol]
+        q = with_retries(lambda: self._option.get_option_latest_quote(req)).get(symbol)
+        if q is None:
+            raise DataError(f"no quote for {symbol}")
         return float(q.bid_price), float(q.ask_price), _et(q.timestamp)

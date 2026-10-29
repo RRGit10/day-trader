@@ -29,6 +29,8 @@ from .orders import Fill, Orders, Settled, UnsettledOrderError
 
 STARTUP_AT = time(9, 25)
 AFFORDABILITY_AT = time(9, 40)
+AFFORDABILITY_RETRY_AT = time(9, 44)
+HEARTBEAT_EVERY = timedelta(seconds=15)
 BAR_FETCH_DELAY = timedelta(seconds=5)
 BAR_RETRY_EVERY = timedelta(seconds=10)
 BAR_RETRY_FOR = timedelta(seconds=60)
@@ -45,6 +47,22 @@ PRIOR_DAY_LOOKBACK = 7
 
 class ExitPaused(RuntimeError):
     """An exit order is unsettled; the exit resumes once it settles (journaled once by Orders)."""
+
+
+class _BeatingClock:
+    """Wraps the clock so that every wait (bar retries, order polls, the main loop) is cut
+    into slices of at most HEARTBEAT_EVERY, with a heartbeat after each slice."""
+
+    def __init__(self, clock: Clock, beat) -> None:
+        self._clock, self._beat = clock, beat
+
+    def now(self) -> datetime:
+        return self._clock.now()
+
+    def sleep_until(self, dt: datetime) -> None:
+        while self._clock.now() < dt:
+            self._clock.sleep_until(min(dt, self._clock.now() + HEARTBEAT_EVERY))
+            self._beat()
 
 
 class Session:
@@ -64,7 +82,8 @@ class Session:
         self.broker = broker
         self.journal = journal
         self.approver = approver
-        self.clock = clock
+        self._beat_warned = False
+        self.clock = _BeatingClock(clock, self._beat)
 
         self.today = clock.now().date()
         self.hours: MarketHours | None = None
@@ -74,8 +93,11 @@ class Session:
         self.prior_bars: dict[str, list[Bar]] = {}
         self.signaled: set[tuple[str, str]] = set()
         self.no_new_entries = False
+        self._afford_retry: list[str] = []  # tickers whose 09:40 check failed on an error
+        self._empty_scan_noted = False
+        self._trigger_closes: dict[str, float] = {}  # ticket id -> signal's trigger close
 
-        self.orders = Orders(broker, clock, self._event)
+        self.orders = Orders(broker, self.clock, self._event)
         self.position: Position | None = None
         self._trade_id: int | None = None
         self._pending_entry: tuple[Ticket, str] | None = None  # entry whose buy is unsettled
@@ -112,6 +134,7 @@ class Session:
         self._exit_unsettled_seen = False  # then broker positions cap every further sell
         self._last_price = pos.entry_price if pos is not None else 0.0  # last known option price
         self._stale_warned = False
+        self._stock_warned = False
 
     def _amend(self, qty: int, entry_price: float, why: str) -> None:
         old = self.position
@@ -178,28 +201,56 @@ class Session:
 
     # ---------------------------------------------------------- affordability
     def affordability_filter(self) -> list[str]:
-        kinds = ["call", "put"] if self.settings.strategy.shorts_enabled else ["call"]
+        """09:40 check. A ticker that failed only because of a data error (not a pick
+        reason) is not skipped yet: retry_affordability() checks it once more at 09:44."""
         kept: list[str] = []
+        self._afford_retry = []
         for tk in self.settings.tickers:
-            reasons: list[str] = []
-            for kind in kinds:
-                try:
-                    chain = self.data.option_chain(tk, kind, self.today)
-                except Exception as exc:
-                    reasons.append("chain_error")
-                    self._event("warn", f"{tk} {kind} chain failed at affordability: {exc!r}")
-                    continue
-                direction = "long" if kind == "call" else "short"
-                pick = pick_contract(direction, chain, self.today, self.settings.contract)
-                if pick.quote is not None:
-                    kept.append(tk)
-                    break
-                reasons.append(str(pick.skip_reason))
+            reasons = self._affordable(tk)
+            if not reasons:
+                kept.append(tk)
+            elif "chain_error" in reasons:
+                self._afford_retry.append(tk)
             else:
-                detail = "; ".join(f"{k}: {r}" for k, r in zip(kinds, reasons))
-                self._skip(tk, reasons[0], detail)
+                self._skip_unaffordable(tk, reasons)
         self.scan_list = kept
         return kept
+
+    def retry_affordability(self) -> list[str]:
+        retry, self._afford_retry = self._afford_retry, []
+        kept = set(self.scan_list)
+        for tk in retry:
+            reasons = self._affordable(tk)
+            if reasons:
+                self._skip_unaffordable(tk, reasons)
+            else:
+                kept.add(tk)
+        self.scan_list = [tk for tk in self.settings.tickers if tk in kept]
+        return self.scan_list
+
+    def _kinds(self) -> list[str]:
+        return ["call", "put"] if self.settings.strategy.shorts_enabled else ["call"]
+
+    def _affordable(self, tk: str) -> list[str]:
+        """[] if an affordable contract exists, else one failure reason per option kind."""
+        reasons: list[str] = []
+        for kind in self._kinds():
+            try:
+                chain = self.data.option_chain(tk, kind, self.today)
+            except Exception as exc:
+                reasons.append("chain_error")
+                self._event("warn", f"{tk} {kind} chain failed at affordability: {exc!r}")
+                continue
+            direction = "long" if kind == "call" else "short"
+            pick = pick_contract(direction, chain, self.today, self.settings.contract)
+            if pick.quote is not None:
+                return []
+            reasons.append(str(pick.skip_reason))
+        return reasons
+
+    def _skip_unaffordable(self, tk: str, reasons: list[str]) -> None:
+        detail = "; ".join(f"{k}: {r}" for k, r in zip(self._kinds(), reasons))
+        self._skip(tk, reasons[0], detail)
 
     # -------------------------------------------------------------- bar close
     def on_bar_close(self, close_time: datetime) -> None:
@@ -227,15 +278,31 @@ class Session:
             self._try_entry(res)
 
     def _fetch_closed_bars(self, close_time: datetime) -> dict[str, list[Bar]]:
+        if not self.scan_list:
+            if not self._empty_scan_noted:
+                self._empty_scan_noted = True
+                self._event("info", "no tickers passed the affordability filter")
+            return {}
         start = self.hours.open if self.hours is not None else self._at(time(9, 30))
-        last_start = close_time - timedelta(minutes=self.settings.strategy.bar_minutes)
+        step = timedelta(minutes=self.settings.strategy.bar_minutes)
+        last_start = close_time - step
+        # the just-closed bar and the one before it must both be there
+        need = [t for t in (last_start - step, last_start) if t >= start]
+        errors: list[Exception] = []
 
         def fetch(tickers: list[str]) -> dict[str, list[Bar]]:
-            got = self.data.bars_5min(tickers, start, close_time)
+            try:
+                got = self.data.bars_5min(tickers, start, close_time)
+            except Exception as exc:  # a data error counts as "missing": retried below
+                if not errors:
+                    self._event("warn", f"bars fetch for the {close_time:%H:%M} close failed "
+                                        f"({exc!r}); retrying")
+                errors.append(exc)
+                return {}
             out = {}
             for tk, bs in got.items():
                 bs = [b for b in bs if b.t < close_time]  # never use an in-progress bar
-                if any(b.t == last_start for b in bs):
+                if all(any(b.t == t for b in bs) for t in need):
                     out[tk] = bs
             return out
 
@@ -248,8 +315,10 @@ class Session:
                 self.manage_position()
             bars.update(fetch(missing))
             missing = [tk for tk in missing if tk not in bars]
+        why = f"; last error {errors[-1]!r}" if errors else ""
         for tk in missing:
-            self._skip(tk, "no_bars", f"bar {last_start:%H:%M} missing after 60s")
+            self._skip(tk, "no_bars",
+                       f"bar {'/'.join(f'{t:%H:%M}' for t in need)} missing after 60s{why}")
         return bars
 
     # ------------------------------------------------------------------ entry
@@ -266,7 +335,11 @@ class Session:
             self._skip(tk, str(why))
             return
         kind = "call" if res.direction == "long" else "put"
-        chain = self.data.option_chain(tk, kind, self.today)
+        try:
+            chain = self.data.option_chain(tk, kind, self.today)
+        except Exception as exc:  # a data error skips this signal, not the day
+            self._skip(tk, "chain_error", repr(exc))
+            return
         pick = pick_contract(res.direction, chain, self.today, self.settings.contract)
         if pick.quote is None:
             self._skip(tk, str(pick.skip_reason))
@@ -283,7 +356,12 @@ class Session:
             if decision != "approved":
                 self._skip(tk, decision, ticket.id)
                 return
-            bid, ask, ts = self.data.latest_option_quote(quote.symbol)
+            try:
+                bid, ask, ts = self.data.latest_option_quote(quote.symbol)
+            except Exception as exc:
+                self.journal.update_ticket(ticket.id, "stale_quote")
+                self._skip(tk, "stale_quote", f"{quote.symbol} re-quote failed: {exc!r}")
+                return
             if ask <= 0 or self.clock.now() - ts > QUOTE_STALE_AFTER:
                 self.journal.update_ticket(ticket.id, "stale_quote")
                 self._skip(tk, "stale_quote", f"{quote.symbol} {bid}/{ask} at {ts.isoformat()}")
@@ -309,8 +387,10 @@ class Session:
         mid, close = res.range_mid, res.trigger_close
         risk = abs(close - mid)
         cfg = self.settings.exits
+        tid = uuid.uuid4().hex
+        self._trigger_closes[tid] = close  # the position's stock R uses the same close
         return Ticket(
-            id=uuid.uuid4().hex, created_at=self.clock.now(), ticker=res.ticker,
+            id=tid, created_at=self.clock.now(), ticker=res.ticker,
             direction=res.direction, option_symbol=quote.symbol, strike=quote.strike,
             expiry=quote.expiry, delta=quote.delta, bid=quote.bid, ask=quote.ask,
             limit=limit, qty=qty, cost=round(limit * qty * 100, 2),
@@ -338,15 +418,10 @@ class Session:
         return self._open(ticket, filled, fill.avg_price)
 
     def _open(self, ticket: Ticket, qty: int, avg_price: float | None) -> Position:
-        try:
-            stock = self.data.latest_stock_price(ticket.ticker)
-        except Exception as exc:
-            stock = (ticket.stock_target + ticket.stock_stop) / 2  # = the trigger close
-            self._event("warn", f"stock price unavailable after fill ({exc!r}); using trigger close")
-        pos = Position(
+        pos = Position(  # stock R from the trigger close, as on the ticket and in the backtest
             ticker=ticket.ticker, direction=ticket.direction, option_symbol=ticket.option_symbol,
             qty=qty, entry_price=avg_price if avg_price is not None else ticket.limit,
-            entry_stock_price=stock, range_mid=ticket.stock_stop, opened_at=self.clock.now(),
+            entry_stock_price=self._trigger_closes[ticket.id], range_mid=ticket.stock_stop, opened_at=self.clock.now(),
         )
         self._set_position(pos, self.journal.open_trade(pos))
         note = "" if qty == ticket.qty else f" (partial: {qty}/{ticket.qty})"
@@ -418,15 +493,27 @@ class Session:
         if self._exit_reason is not None:
             self.exit_position(self._exit_reason)  # resume an exit that was paused
             return
-        bid, ask, ts = self.data.latest_option_quote(pos.option_symbol)
-        stock = self.data.latest_stock_price(pos.ticker)
+        try:
+            stock = self.data.latest_stock_price(pos.ticker)
+        except Exception as exc:  # no stock price: no exit decision this pass
+            if not self._stock_warned:
+                self._stock_warned = True
+                self._event("warn", f"{pos.ticker} stock price unavailable ({exc!r}); "
+                                    "waiting for the next pass")
+            return
+        self._stock_warned = False
         now = self.clock.now()
-        mid: float | None = (bid + ask) / 2 if ask > 0 else None
-        if now - ts > QUOTE_STALE_AFTER:
+        try:
+            bid, ask, ts = self.data.latest_option_quote(pos.option_symbol)
+            mid: float | None = (bid + ask) / 2 if ask > 0 else None
+            stale = f"stale since {ts.isoformat()}" if now - ts > QUOTE_STALE_AFTER else None
+        except Exception as exc:  # treated like a stale quote
+            mid, stale = None, f"unavailable ({exc!r})"
+        if stale is not None:
             mid = None
             if not self._stale_warned:
                 self._stale_warned = True
-                self._event("warn", f"{pos.option_symbol} quote stale since {ts.isoformat()}; "
+                self._event("warn", f"{pos.option_symbol} quote {stale}; "
                                     "using stock-based exits only")
         if mid is not None:
             self._last_price = mid
@@ -505,7 +592,16 @@ class Session:
         return closed
 
     # ---------------------------------------------------------------- the day
-    def _write_heartbeat(self) -> None:
+    def _beat(self) -> None:
+        """Heartbeat from inside waits: a failed write must never interrupt trading."""
+        try:
+            self.write_heartbeat()
+        except Exception as exc:
+            if not self._beat_warned:
+                self._beat_warned = True
+                self._event("warn", f"heartbeat write failed: {exc!r}")
+
+    def write_heartbeat(self) -> None:
         state_dir = self.settings.state_dir
         state_dir.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -529,10 +625,12 @@ class Session:
     def run_day(self) -> None:
         self.today = self.clock.now().date()
         self.clock.sleep_until(self._at(STARTUP_AT))
+        self._beat()
         self.startup()
         if self.hours is None:
             return
         afford_at = self._at(AFFORDABILITY_AT)
+        afford_retry_at = self._at(AFFORDABILITY_RETRY_AT)
         flat_at = self._at(self.flat_time)
         end_at = self.hours.close + SUMMARY_AFTER_CLOSE
         step = timedelta(minutes=self.settings.strategy.bar_minutes)
@@ -548,15 +646,20 @@ class Session:
 
         while True:
             now = self.clock.now()
-            self._write_heartbeat()
+            self._beat()
             if now >= end_at:
                 self._summary()
-                self._write_heartbeat()
+                self._beat()
                 return
             if not afford_done and now >= afford_at:
                 afford_done = True
                 try:
                     self.affordability_filter()
+                except Exception:
+                    self._error()
+            elif afford_done and self._afford_retry and now >= afford_retry_at:
+                try:
+                    self.retry_affordability()
                 except Exception:
                     self._error()
             elif pending and now >= pending[0] + BAR_FETCH_DELAY:
@@ -574,9 +677,11 @@ class Session:
                 self.manage_position()
                 next_manage = self.clock.now() + MANAGE_EVERY
             else:
-                events = [end_at]
+                events = [end_at, now + HEARTBEAT_EVERY]
                 if not afford_done:
                     events.append(afford_at)
+                elif self._afford_retry:
+                    events.append(afford_retry_at)
                 if pending:
                     events.append(pending[0] + BAR_FETCH_DELAY)
                 if not flattened:
