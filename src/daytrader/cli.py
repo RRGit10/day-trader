@@ -28,6 +28,7 @@ from .session import STARTUP_GIVE_UP_AT, STARTUP_RETRY_EVERY, Session
 
 BACKTEST_EARLIEST = date(2024, 2, 1)
 STALE_AFTER_S = 60
+TICKET_SHOWN_FOR = timedelta(minutes=2)  # = the engine's ticket expiry
 
 
 @dataclass
@@ -76,7 +77,33 @@ def _months_before(d: date, months: int) -> date:
     return date(year, month, min(d.day, monthrange(year, month)[1]))
 
 
+def _kernel32():  # pragma: no cover - Windows only
+    import ctypes
+
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _win_pid_alive(pid: int) -> bool:
+    """os.kill(pid, 0) would terminate the process on Windows: ask for its exit code."""
+    import ctypes
+
+    process_query_limited_information, still_active = 0x1000, 259
+    k32 = _kernel32()
+    handle = k32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return False  # no such process (or not ours to query)
+    try:
+        code = ctypes.c_ulong()
+        if not k32.GetExitCodeProcess(handle, ctypes.pointer(code)):
+            return True  # cannot tell: assume running, never steal a live lock
+        return code.value == still_active
+    finally:
+        k32.CloseHandle(handle)
+
+
 def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        return _win_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -162,15 +189,20 @@ def _cmd_scan(args, settings: Settings, deps: Deps) -> int:
     if hours is None:
         print(f"market closed on {today.isoformat()}")
         return 0
+    is_open = now >= hours.open
     prior: dict = {}
-    day = today
-    for _ in range(10):
-        day -= timedelta(days=1)
-        ph = data.market_hours(day)
-        if ph is not None:
-            prior = data.bars_5min(list(settings.tickers), ph.open, ph.close)
-            break
-    bars = data.bars_5min(list(settings.tickers), hours.open, min(now, hours.close))
+    bars: dict = {}
+    if is_open:
+        day = today
+        for _ in range(10):
+            day -= timedelta(days=1)
+            ph = data.market_hours(day)
+            if ph is not None:
+                prior = data.bars_5min(list(settings.tickers), ph.open, ph.close)
+                break
+        bars = data.bars_5min(list(settings.tickers), hours.open, min(now, hours.close))
+    else:
+        print("market not open yet — showing affordability only")
     kinds = ["call", "put"] if settings.strategy.shorts_enabled else ["call"]
     print(f"{'TICKER':<8}{'STATUS':<22}CHECKS")
     for tk in settings.tickers:
@@ -188,9 +220,11 @@ def _cmd_scan(args, settings: Settings, deps: Deps) -> int:
                 break
             reasons.append(str(pick.skip_reason))
         status = "eligible" if not reasons else reasons[0]
-        res = evaluate_orb(tk, prior.get(tk, []), bars.get(tk, []), settings.strategy)
-        checks = "  ".join(f"{c.name} {'✓' if c.passed else '✗'}" for c in res.checks)
-        print(f"{tk:<8}{status:<22}{checks}")
+        checks = ""
+        if is_open:
+            res = evaluate_orb(tk, prior.get(tk, []), bars.get(tk, []), settings.strategy)
+            checks = "  ".join(f"{c.name} {'✓' if c.passed else '✗'}" for c in res.checks)
+        print(f"{tk:<8}{status:<22}{checks}".rstrip())
     return 0
 
 
@@ -202,17 +236,22 @@ def _cmd_decide(args, settings: Settings, decision: str) -> int:
     return 0
 
 
-def _cmd_pending(args, settings: Settings) -> int:
-    files = sorted((settings.state_dir / "approval" / "pending").glob("*.json"))
-    if not files:
-        print("No pending tickets.")
-        return 0
-    for f in files:
+def _cmd_pending(args, settings: Settings, deps: Deps) -> int:
+    """Live tickets only: one older than 2 minutes has expired (or is left from a crash)."""
+    now = deps.now()
+    shown = 0
+    for f in sorted((settings.state_dir / "approval" / "pending").glob("*.json")):
         try:
             ticket = Ticket.from_dict(json.loads(f.read_text()))
         except (OSError, ValueError, KeyError):
             continue  # being written or removed
-        print(f"{ticket.id}  {ticket.summary()}")
+        if now - ticket.created_at > TICKET_SHOWN_FOR:
+            continue
+        created = ticket.created_at.astimezone(ET)
+        print(f"{ticket.id}  created {created:%H:%M:%S} ET  {ticket.summary()}")
+        shown += 1
+    if not shown:
+        print("No pending tickets.")
     return 0
 
 
@@ -226,10 +265,14 @@ def _cmd_status(args, settings: Settings, deps: Deps) -> int:
     if not hb.is_file():
         print(f"{args.mode}: not running (no heartbeat)")
     else:
-        ts = datetime.fromisoformat(json.loads(hb.read_text())["ts"])
-        age = (now - ts).total_seconds()
-        stale = age > STALE_AFTER_S and _market_hours_now(now)
-        print(f"{args.mode}: heartbeat {age:.0f}s ago" + (" -- STALE" if stale else ""))
+        try:
+            ts = datetime.fromisoformat(json.loads(hb.read_text())["ts"])
+            age = (now - ts).total_seconds()
+        except (OSError, ValueError, KeyError, TypeError):
+            print(f"{args.mode}: heartbeat unreadable")
+        else:
+            stale = age > STALE_AFTER_S and _market_hours_now(now)
+            print(f"{args.mode}: heartbeat {age:.0f}s ago" + (" -- STALE" if stale else ""))
     path = _journal_path(settings, args.mode)
     if not path.is_file():
         print("no journal yet")
@@ -305,6 +348,8 @@ def _cmd_doctor(args, settings: Settings, deps: Deps) -> int:
         failed |= not ok
         print(f"{'PASS' if ok else 'FAIL'}  {text}")
 
+    max_spread = settings.contract.max_spread_pct
+
     for name, prefix, keys in (("approval", "APPROVAL", settings.approval_keys),
                                ("bot", "BOT", settings.bot_keys)):
         if keys is None:
@@ -322,8 +367,8 @@ def _cmd_doctor(args, settings: Settings, deps: Deps) -> int:
         line(True, f"{name}: keys verified as paper")
         try:
             level = int(broker.get_account().options_trading_level)
-            line(level >= 1, f"{name}: options trading level {level} "
-                             f"({'long calls/puts allowed' if level >= 1 else 'need >= 1'})")
+            line(level >= 2, f"{name}: options trading level {level} "
+                             f"({'buying calls/puts allowed' if level >= 2 else 'need >= 2 to buy calls/puts'})")
         except Exception as exc:
             line(False, f"{name}: options approval check: {exc!r}")
         try:
@@ -341,6 +386,14 @@ def _cmd_doctor(args, settings: Settings, deps: Deps) -> int:
                                        + (f" ({len(bars['SPY'])} bars on {day})" if bars.get("SPY") else " (none)"))
             chain = data.option_chain("SPY", "call", today)
             line(bool(chain), f"{name}: SPY option chain ({len(chain)} contracts)")
+            quoted = [q for q in chain if q.delta is not None and q.bid > 0]
+            line(bool(quoted), f"{name}: SPY quotes with delta and bid > 0 ({len(quoted)})")
+            tight = sum(1 for q in quoted if q.spread_pct <= max_spread)
+            text = f"{name}: {tight} SPY weeklies within the {max_spread:.0%} spread filter"
+            if tight:
+                line(True, text)
+            else:  # quotes can be wide before the open or on the indicative feed
+                print(f"WARN  {text}")
         except Exception as exc:
             line(False, f"{name}: data check: {exc!r}")
     return 1 if failed else 0
@@ -355,8 +408,8 @@ def _cmd_record(args, settings: Settings, deps: Deps) -> int:
     def enc(bars):
         return [[b.t.isoformat(), b.o, b.h, b.l, b.c, b.v] for b in bars]
 
-    expiries = source.expiries_after(tickers[0], args.date) if tickers else []
     for tk in tickers:
+        expiries = source.expiries_after(tk, args.date)
         five = source.stock_bars(tk, args.date, 5)
         payload = {"ticker": tk, "date": args.date.isoformat(), "bars_5min": enc(five),
                    "bars_1min": enc(source.stock_bars(tk, args.date, 1)), "option_bars": {}}
@@ -421,7 +474,7 @@ def main(argv: Sequence[str] | None = None, deps: Deps | None = None) -> int:
         if cmd in ("approve", "reject"):
             return _cmd_decide(args, settings, "approve" if cmd == "approve" else "reject")
         if cmd == "pending":
-            return _cmd_pending(args, settings)
+            return _cmd_pending(args, settings, deps)
         if cmd == "status":
             return _cmd_status(args, settings, deps)
         if cmd == "report":

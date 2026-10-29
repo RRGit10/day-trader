@@ -1,5 +1,6 @@
 import json
 import os
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -107,15 +108,30 @@ def test_approve_and_reject_write_decision(cfg, tmp_path):
     assert json.loads(dec.read_text()) == {"decision": "reject"}
 
 
-def test_pending_lists_summaries(cfg, tmp_path, capsys):
-    assert run(cfg, "pending") == 0
+def test_pending_lists_summaries_with_created_time(cfg, tmp_path, capsys):
+    deps = cli.Deps(now=lambda: NOW + timedelta(seconds=30))
+    assert run(cfg, "pending", deps=deps) == 0
     assert "No pending tickets." in capsys.readouterr().out
     pend = tmp_path / "state" / "approval" / "pending"
     pend.mkdir(parents=True)
     t = make_ticket()
     (pend / "t1.json").write_text(json.dumps(t.to_dict()))
-    assert run(cfg, "pending") == 0
-    assert f"t1  {t.summary()}" in capsys.readouterr().out
+    assert run(cfg, "pending", deps=deps) == 0
+    assert f"t1  created 10:00:00 ET  {t.summary()}" in capsys.readouterr().out
+
+
+def test_pending_hides_tickets_older_than_2_minutes(cfg, tmp_path, capsys):
+    pend = tmp_path / "state" / "approval" / "pending"
+    pend.mkdir(parents=True)
+    old = make_ticket("old")
+    new = replace(make_ticket("new"), created_at=NOW + timedelta(minutes=2))
+    for t in (old, new):
+        (pend / f"{t.id}.json").write_text(json.dumps(t.to_dict()))
+    assert run(cfg, "pending", deps=cli.Deps(now=lambda: NOW + timedelta(minutes=2, seconds=1))) == 0
+    out = capsys.readouterr().out
+    assert "new  created" in out and "old" not in out
+    assert run(cfg, "pending", deps=cli.Deps(now=lambda: NOW + timedelta(minutes=5))) == 0
+    assert "No pending tickets." in capsys.readouterr().out
 
 
 # ------------------------------------------------------------------- status
@@ -154,6 +170,16 @@ def test_status_not_running_and_journal_state(cfg, tmp_path, capsys):
     run(cfg, "status", deps=cli.Deps(now=lambda: NOW))
     out = capsys.readouterr().out
     assert "AAPLP" in out and "-$100.00" in out and "blocked (position_open)" in out
+
+
+@pytest.mark.parametrize("content", ["{not json", json.dumps({"no_ts": 1}),
+                                     json.dumps({"ts": "yesterday"})])
+def test_status_unreadable_heartbeat(cfg, tmp_path, capsys, content):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "heartbeat-bot.json").write_text(content)
+    assert run(cfg, "status", deps=cli.Deps(now=lambda: NOW)) == 0
+    assert "bot: heartbeat unreadable" in capsys.readouterr().out
 
 
 # ------------------------------------------------------------------- report
@@ -317,6 +343,44 @@ def test_run_approval_heartbeats_while_waiting_for_a_decision(cfg, keys, monkeyp
     assert session.approver.on_poll == session.write_heartbeat
 
 
+def test_pid_alive_posix():
+    assert cli._pid_alive(os.getpid())
+    assert not cli._pid_alive(999_999_999)
+
+
+class FakeKernel32:
+    """OpenProcess handle = pid + 100 (0 = no such process); exit codes per handle."""
+
+    def __init__(self, exit_codes):
+        self.exit_codes, self.closed = exit_codes, []
+
+    def OpenProcess(self, access, inherit, pid):
+        return 0 if pid not in self.exit_codes else pid + 100
+
+    def GetExitCodeProcess(self, handle, code_ptr):
+        code_ptr.contents.value = self.exit_codes[handle - 100]
+        return 1
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        return 1
+
+
+def test_pid_alive_windows_uses_exit_code_not_kill(monkeypatch):
+    k32 = FakeKernel32({1: 259, 3: 0})  # pid 1 running (STILL_ACTIVE), pid 3 exited
+
+    def no_kill(*a):
+        raise AssertionError("os.kill must not be used on Windows")
+
+    monkeypatch.setattr(cli, "_kernel32", lambda: k32)
+    monkeypatch.setattr(cli.os, "kill", no_kill)
+    monkeypatch.setattr(cli.os, "name", "nt")
+    results = [cli._pid_alive(1), cli._pid_alive(2), cli._pid_alive(3)]
+    monkeypatch.undo()
+    assert results == [True, False, False]
+    assert k32.closed == [101, 103]
+
+
 def test_run_missing_keys_removes_lock(cfg, tmp_path, capsys):
     assert run(cfg, "run", "--mode", "bot") == 1
     assert "missing API keys" in capsys.readouterr().out
@@ -341,7 +405,10 @@ def doctor_deps(level=2, paper_ok=True, chain=True):
         if d == 1:
             data.bars["SPY"] = [Bar(data.hours[day].open, 1, 1, 1, 1, 1)]
     if chain:
-        data.chains[("SPY", "call")] = [OptionQuote("SPYC", "SPY", "call", 500, NOW.date(), 1, 1.1, 0.6, 600)]
+        data.chains[("SPY", "call")] = [
+            OptionQuote("SPYC1", "SPY", "call", 500, NOW.date(), 1.0, 1.04, 0.6, 600),  # 3.9%
+            OptionQuote(*chain) if isinstance(chain, tuple) else
+            OptionQuote("SPYC2", "SPY", "call", 505, NOW.date(), 1.0, 1.2, 0.5, 600)]  # 18%
 
     def broker(keys, mode):
         if not paper_ok:
@@ -354,7 +421,30 @@ def doctor_deps(level=2, paper_ok=True, chain=True):
 def test_doctor_all_pass(cfg, keys, capsys):
     assert run(cfg, "doctor", deps=doctor_deps()) == 0
     out = capsys.readouterr().out
-    assert out.count("PASS") == 10 and "FAIL" not in out and "options trading level 2" in out
+    assert out.count("PASS") == 14 and "FAIL" not in out and "options trading level 2" in out
+    assert "PASS  bot: SPY quotes with delta and bid > 0 (2)" in out
+    assert "PASS  bot: 1 SPY weeklies within the 5% spread filter" in out
+
+
+def test_doctor_level_1_fails(cfg, keys, capsys):
+    assert run(cfg, "doctor", deps=doctor_deps(level=1)) == 1
+    assert "FAIL  approval: options trading level 1 (need >= 2" in capsys.readouterr().out
+
+
+def test_doctor_no_tight_spreads_warns_not_fails(cfg, keys, capsys):
+    deps = doctor_deps()
+    chain = deps.data(None).chains[("SPY", "call")]
+    chain[0] = replace(chain[0], ask=1.3)
+    assert run(cfg, "doctor", deps=deps) == 0
+    assert "WARN  bot: 0 SPY weeklies within the 5% spread filter" in capsys.readouterr().out
+
+
+def test_doctor_chain_without_delta_or_bid_fails(cfg, keys, capsys):
+    deps = doctor_deps()
+    chain = deps.data(None).chains[("SPY", "call")]
+    chain[:] = [replace(q, delta=None) for q in chain[:1]] + [replace(q, bid=0.0) for q in chain[1:]]
+    assert run(cfg, "doctor", deps=deps) == 1
+    assert "FAIL  bot: SPY quotes with delta and bid > 0 (0)" in capsys.readouterr().out
 
 
 def test_doctor_missing_keys_fail_names_env_vars(cfg, capsys):
@@ -391,7 +481,46 @@ def test_record_writes_fixture(cfg, keys, tmp_path):
     assert payload["option_bars"]["SPYP500"]["bars_1min"][0][1] == 1.0
 
 
+def test_record_expiries_per_ticker(cfg, keys, tmp_path):
+    day = date(2026, 10, 1)
+    h = FakeHistorical()
+    t0 = datetime(2026, 10, 1, 9, 30, tzinfo=ET)
+    for tk in ("SPY", "AAPL"):
+        h.stock[(tk, day, 5)] = [Bar(t0, 100, 101, 99, 100, 10)]
+    h.contracts[("SPY", "call", date(2026, 10, 2))] = [("SPYC", 100.0)]
+    h.contracts[("AAPL", "call", date(2026, 10, 3))] = [("AAPLC", 100.0)]  # AAPL: no 10/02
+    out = tmp_path / "fx"
+    assert run(cfg, "record", "--date", "2026-10-01", "--tickers", "SPY,AAPL", "--out", str(out),
+               deps=hist_deps(h)) == 0
+    aapl = json.loads((out / "AAPL-2026-10-01.json").read_text())
+    assert aapl["option_bars"]["AAPLC"]["expiry"] == "2026-10-03"
+
+
 # --------------------------------------------------------------------- scan
+class StrictData(FakeData):
+    def __init__(self):
+        super().__init__()
+        self.bar_calls = []
+
+    def bars_5min(self, tickers, start, end):
+        assert end >= start, "bars requested with end < start"
+        self.bar_calls.append((start, end))
+        return super().bars_5min(tickers, start, end)
+
+
+def test_scan_before_open_shows_affordability_only(cfg, keys, capsys):
+    data = StrictData()
+    early = NOW.replace(hour=9, minute=20)
+    data.hours[early.date()] = MarketHours(NOW.replace(hour=9, minute=30), NOW.replace(hour=16))
+    data.hours[early.date() - timedelta(days=1)] = MarketHours(
+        NOW.replace(day=28, hour=9, minute=30), NOW.replace(day=28, hour=16))
+    assert run(cfg, "scan", deps=cli.Deps(data=lambda k: data, now=lambda: early)) == 0
+    out = capsys.readouterr().out
+    assert "market not open yet — showing affordability only" in out
+    assert "SPY" in out and "AAPL" in out and "✗" not in out
+    assert data.bar_calls == []
+
+
 def test_scan_prints_table(cfg, keys, capsys):
     data = FakeData()
     day = NOW.date()

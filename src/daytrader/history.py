@@ -27,6 +27,7 @@ from .models import ET, Bar, OptionType
 CALLS_PER_MINUTE = 180
 DAY_OPEN, DAY_CLOSE = time(9, 30), time(16, 0)
 EXPIRY_LOOKAHEAD = timedelta(days=10)  # same expiry window as the live option chain
+RECENT_DAYS = 3  # empty answers for days this recent may just be data not published yet
 
 
 class RateLimiter:
@@ -69,13 +70,15 @@ class AlpacaHistorical:
     def __init__(self, keys: Keys, cache_dir: Path, *,
                  now: Callable[[], float] = _time.monotonic,
                  sleep: Callable[[float], None] = _time.sleep,
-                 calls_per_minute: int = CALLS_PER_MINUTE) -> None:
+                 calls_per_minute: int = CALLS_PER_MINUTE,
+                 today: Callable[[], date] = lambda: datetime.now(ET).date()) -> None:
         self._stock = StockHistoricalDataClient(keys.api_key, keys.api_secret)
         self._option = OptionHistoricalDataClient(keys.api_key, keys.api_secret)
         self._trading = TradingClient(keys.api_key, keys.api_secret, paper=True)
         self._cache_dir = Path(cache_dir)
         self._limiter = RateLimiter(calls_per_minute, 60.0, now, sleep)
         self._sleep = sleep
+        self._today = today
 
     # ------------------------------------------------------------- plumbing
     def _call(self, fn: Callable[[], Any]) -> Any:
@@ -84,17 +87,25 @@ class AlpacaHistorical:
             return fn()
         return with_retries(limited, sleep=self._sleep)
 
-    def _cached(self, key: dict, fetch: Callable[[], Any]) -> Any:
+    def _cached(self, key: dict, fetch: Callable[[], Any], day: date | None = None) -> Any:
+        """Read-through cache; an empty answer for a `day` in the last RECENT_DAYS calendar
+        days is returned but not cached."""
         canonical = json.dumps(key, sort_keys=True, separators=(",", ":"))
         path = self._cache_dir / f"{hashlib.sha256(canonical.encode()).hexdigest()}.json"
         if path.is_file():
             return json.loads(path.read_text())["value"]
         value = fetch()
+        if not value and day is not None and (self._today() - day).days <= RECENT_DAYS:
+            return value
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self._cache_dir, suffix=".tmp")
-        with os.fdopen(fd, "w") as fh:
-            json.dump({"key": key, "value": value}, fh)
-        os.replace(tmp, path)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"key": key, "value": value}, fh)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
         return value
 
     def _window(self, day: date) -> tuple[datetime, datetime]:
@@ -137,7 +148,7 @@ class AlpacaHistorical:
                                    start=start, end=end, feed=DataFeed.SIP)
             return _bars_to_json(self._call(lambda: self._stock.get_stock_bars(req)).data.get(ticker, []))
         key = {"m": "stock_bars", "ticker": ticker, "day": day.isoformat(), "minutes": minutes, "feed": "sip"}
-        return _bars_from_json(self._cached(key, fetch))
+        return _bars_from_json(self._cached(key, fetch, day))
 
     def option_bars_1min(self, symbol: str, day: date) -> list[Bar]:
         def fetch():
@@ -145,7 +156,8 @@ class AlpacaHistorical:
             req = OptionBarsRequest(symbol_or_symbols=[symbol],
                                     timeframe=TimeFrame(1, TimeFrameUnit.Minute), start=start, end=end)
             return _bars_to_json(self._call(lambda: self._option.get_option_bars(req)).data.get(symbol, []))
-        return _bars_from_json(self._cached({"m": "option_bars", "symbol": symbol, "day": day.isoformat()}, fetch))
+        key = {"m": "option_bars", "symbol": symbol, "day": day.isoformat()}
+        return _bars_from_json(self._cached(key, fetch, day))
 
     def option_contracts(self, underlying: str, kind: OptionType, expiry: date) -> list[tuple[str, float]]:
         key = {"m": "option_contracts", "underlying": underlying, "kind": kind, "expiry": expiry.isoformat()}

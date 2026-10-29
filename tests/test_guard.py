@@ -1,5 +1,7 @@
 from datetime import datetime
 
+import pytest
+
 from daytrader.config import RiskConfig
 from daytrader.guard import may_enter
 from daytrader.models import ET, ClosedTrade
@@ -46,3 +48,9 @@ def test_max_losses_before_loss_limit():
 
 def test_breakeven_not_a_loss():
     assert may_enter([tr(0), tr(-10)], False, CFG) == (True, None)
+
+
+@pytest.mark.parametrize("pnls", [(79.13, 5.82, 15.05),  # 99.99999999999999 on Python 3.11
+                                  (4.14, 0.29, 95.57)])  # below 100 even with 3.12+'s sum()
+def test_float_sum_rounded_to_cents(pnls):
+    assert may_enter([tr(p) for p in pnls], False, CFG) == (False, "profit_target_hit")

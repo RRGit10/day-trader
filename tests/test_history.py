@@ -21,6 +21,7 @@ DAY = date(2026, 10, 28)
 
 
 def make(tmp_path, **kw) -> AlpacaHistorical:
+    kw.setdefault("today", lambda: date(2026, 12, 31))  # DAY is long past: cache empties too
     h = AlpacaHistorical(Keys("k", "s"), tmp_path / "cache", **kw)
     h._stock, h._option, h._trading = MagicMock(), MagicMock(), MagicMock()
     return h
@@ -151,3 +152,31 @@ def test_sdk_calls_go_through_the_limiter(tmp_path):
     assert slept == []
     h.stock_bars("B", DAY, 5)
     assert slept == [60.0]
+
+
+@pytest.mark.parametrize("age_days,cached", [(0, False), (3, False), (4, True)])
+def test_empty_recent_days_are_not_cached(tmp_path, age_days, cached):
+    from datetime import timedelta
+
+    h = make(tmp_path, today=lambda: DAY + timedelta(days=age_days))
+    h._stock.get_stock_bars.return_value = NS(data={})
+    assert h.stock_bars("AAPL", DAY, 5) == []
+    h._option.get_option_bars.return_value = NS(data={})
+    assert h.option_bars_1min("X", DAY) == []
+    files = list((tmp_path / "cache").glob("*.json")) if (tmp_path / "cache").exists() else []
+    assert len(files) == (2 if cached else 0)
+
+
+def test_cache_write_failure_leaves_no_tmp_file(tmp_path, monkeypatch):
+    import daytrader.history as history_mod
+
+    h = make(tmp_path)
+    h._stock.get_stock_bars.return_value = NS(data={})
+
+    def boom(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(history_mod.os, "replace", boom)
+    with pytest.raises(OSError):
+        h.stock_bars("AAPL", date(2020, 1, 2), 5)
+    assert list((tmp_path / "cache").iterdir()) == []
