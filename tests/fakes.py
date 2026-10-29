@@ -216,3 +216,32 @@ class ScriptedApprover:
         if self.on_request is not None:
             self.on_request(ticket)
         return self.decisions.pop(0) if self.decisions else "approved"
+
+
+class FakeHistorical:
+    """In-memory HistoricalSource built from dicts.
+
+    hours[day] = MarketHours; stock[(ticker, day, minutes)] = bars;
+    contracts[(underlying, kind, expiry)] = [(symbol, strike)]; option_bars[(symbol, day)] = bars.
+    """
+
+    def __init__(self) -> None:
+        self.hours: dict[date, MarketHours] = {}
+        self.stock: dict[tuple[str, date, int], list[Bar]] = {}
+        self.contracts: dict[tuple[str, str, date], list[tuple[str, float]]] = {}
+        self.option_bars: dict[tuple[str, date], list[Bar]] = {}
+
+    def trading_days(self, start: date, end: date) -> list[tuple[date, MarketHours]]:
+        return sorted((d, h) for d, h in self.hours.items() if start <= d <= end)
+
+    def stock_bars(self, ticker: str, day: date, minutes: int) -> list[Bar]:
+        return list(self.stock.get((ticker, day, minutes), []))
+
+    def option_contracts(self, underlying: str, kind: OptionType, expiry: date) -> list[tuple[str, float]]:
+        return list(self.contracts.get((underlying, kind, expiry), []))
+
+    def expiries_after(self, underlying: str, day: date) -> list[date]:
+        return sorted({e for (u, _, e) in self.contracts if u == underlying and e > day})
+
+    def option_bars_1min(self, symbol: str, day: date) -> list[Bar]:
+        return list(self.option_bars.get((symbol, day), []))
