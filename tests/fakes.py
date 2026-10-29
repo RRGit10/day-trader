@@ -57,10 +57,17 @@ class FakeData:
 
 
 class FakeBroker:
-    """In-memory Broker. fill_policy: "fill" | "partial" | "never" (may change between calls)."""
+    """In-memory Broker. fill_policy: "fill" | "partial" | "never" (may change between calls).
 
-    def __init__(self, fill_policy: str = "fill") -> None:
+    market_fill_policy, if set, applies to market orders instead of fill_policy.
+    """
+
+    def __init__(self, fill_policy: str = "fill", market_fill_policy: str | None = None) -> None:
         self.fill_policy = fill_policy
+        self.market_fill_policy = market_fill_policy  # overrides fill_policy for market orders
+        self.cancel_raises = False  # cancel succeeds, then raises (like a lost response)
+        self.fill_on_cancel = False  # the order fills completely in a race with the cancel
+        self.cancels: list[str] = []
         self.orders: list[dict] = []
         self.market_price: dict[str, float] = {}
         self._state: dict[str, dict] = {}
@@ -72,9 +79,12 @@ class FakeBroker:
             {"side": side, "symbol": symbol, "qty": qty, "limit": limit, "type": type_}
         )
         price = limit if limit is not None else self.market_price.get(symbol, 0.0)
-        if self.fill_policy == "fill":
+        policy = self.fill_policy
+        if type_ == "market" and self.market_fill_policy is not None:
+            policy = self.market_fill_policy
+        if policy == "fill":
             filled, status = qty, "filled"
-        elif self.fill_policy == "partial" and qty >= 2:
+        elif policy == "partial" and qty >= 2:
             filled, status = qty // 2, "partially_filled"
         else:  # "never", or a 1-lot under "partial"
             filled, status = 0, "new"
@@ -101,7 +111,20 @@ class FakeBroker:
         return self._place("sell", symbol, qty, None, "market")
 
     def cancel(self, order_id: str) -> None:
-        self._state[order_id]["status"] = "canceled"
+        self.cancels.append(order_id)
+        s = self._state[order_id]
+        if self.fill_on_cancel and s["status"] in ("new", "partially_filled"):
+            o = self.orders[int(order_id[1:]) - 1]
+            more = o["qty"] - s["filled"]
+            s.update(status="filled", filled=o["qty"], price=o["limit"] or s["price"])
+            sign = 1 if s["side"] == "buy" else -1
+            self._positions[s["symbol"]] = self._positions.get(s["symbol"], 0) + sign * more
+            if not self._positions[s["symbol"]]:
+                del self._positions[s["symbol"]]
+            return
+        s["status"] = "canceled"
+        if self.cancel_raises:
+            raise RuntimeError("cancel response lost")
 
     def order_status(self, order_id: str):
         from daytrader.broker import OrderStatus
@@ -111,3 +134,57 @@ class FakeBroker:
 
     def positions(self) -> dict[str, int]:
         return dict(self._positions)
+
+
+class LiveFakeData(FakeData):
+    """FakeData for session tests.
+
+    Option quotes stored with ts=None are stamped with the clock's current time.
+    `fail[method] = exc` makes that method raise. `bar_calls` records each bars fetch.
+    """
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.fail: dict[str, Exception] = {}
+        self.bar_calls: list[tuple[list[str], datetime]] = []
+
+    def _maybe_fail(self, name: str) -> None:
+        if name in self.fail:
+            raise self.fail[name]
+
+    def set_quote(self, symbol: str, bid: float, ask: float, ts: datetime | None = None) -> None:
+        self.option_quotes[symbol] = (bid, ask, ts)
+
+    def bars_5min(self, tickers, start, end):
+        self._maybe_fail("bars_5min")
+        self.bar_calls.append((list(tickers), self.clock.now()))
+        return super().bars_5min(tickers, start, end)
+
+    def option_chain(self, underlying, kind, today):
+        self._maybe_fail("option_chain")
+        return super().option_chain(underlying, kind, today)
+
+    def latest_stock_price(self, ticker):
+        self._maybe_fail("latest_stock_price")
+        return super().latest_stock_price(ticker)
+
+    def latest_option_quote(self, symbol):
+        self._maybe_fail("latest_option_quote")
+        bid, ask, ts = self.option_quotes[symbol]
+        return bid, ask, ts if ts is not None else self.clock.now()
+
+
+class ScriptedApprover:
+    """Returns scripted decisions in order (then "approved"); records every ticket."""
+
+    def __init__(self, decisions: Sequence[str] = (), on_request=None) -> None:
+        self.decisions = list(decisions)
+        self.tickets: list = []
+        self.on_request = on_request
+
+    def request(self, ticket):
+        self.tickets.append(ticket)
+        if self.on_request is not None:
+            self.on_request(ticket)
+        return self.decisions.pop(0) if self.decisions else "approved"
