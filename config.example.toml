@@ -1,0 +1,41 @@
+[universe]
+tickers = ["SPY", "QQQ", "IWM", "TSLA", "NVDA", "AMD", "AAPL", "META", "AMZN", "MSFT", "PLTR", "SOFI", "F", "BAC", "INTC", "AAL", "NIO", "RIVN", "HOOD", "MARA"]
+
+[strategy]
+range_minutes = 15
+bar_minutes = 5
+entry_start = "09:55"
+entry_end = "11:30"
+shorts_enabled = true
+ema_period = 9
+rsi_period = 14
+rsi_long_min = 60.0
+rsi_short_max = 40.0
+
+[contract]
+delta_min = 0.60
+delta_max = 0.70
+delta_target = 0.65
+max_spread_pct = 0.05
+min_open_interest = 500
+max_price = 5.00
+
+[exits]
+take_profit_pct = 0.20
+stop_loss_pct = 0.10
+flat_time = "15:55"
+
+[risk]
+budget_per_trade = 500.0
+daily_profit_target = 100.0
+max_losses = 2
+daily_loss_limit = 100.0
+
+[backtest]
+assumed_spread_pct = 0.03
+risk_free_rate = 0.04
+default_months = 12
+
+[paths]
+# Relative paths resolve against this file's directory. Default: ./state
+# state_dir = "state"
