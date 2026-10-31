@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daytrader"
+version = "0.1.0"
+description = "Opening-range-breakout options engine for Alpaca paper accounts"
+requires-python = ">=3.11"
+dependencies = ["alpaca-py>=0.44,<0.45"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+daytrader = "daytrader.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+filterwarnings = [
+    # third-party: alpaca-py imports websockets.legacy, deprecated upstream
+    "ignore:websockets.legacy is deprecated:DeprecationWarning",
+]

@@ -1,0 +1,8 @@
+{
+  "name": "daytrader",
+  "description": "Opening-range-breakout options day trading on Alpaca paper accounts: approval-mode trade sessions, scans, status, reports and backtests.",
+  "version": "0.1.0",
+  "author": {"name": "Rabin Regmi"},
+  "license": "MIT",
+  "keywords": ["trading", "options", "day-trading", "alpaca", "paper-trading", "backtest"]
+}
