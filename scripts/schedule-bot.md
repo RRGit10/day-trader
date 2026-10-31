@@ -28,6 +28,8 @@ Save as `~/Library/LaunchAgents/com.daytrader.bot.plist`:
   <key>WorkingDirectory</key><string>/path/to/project</string>
   <key>ProgramArguments</key>
   <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
     <string>/full/path/to/daytrader</string>
     <string>run</string>
     <string>--mode</string>
@@ -47,7 +49,7 @@ Save as `~/Library/LaunchAgents/com.daytrader.bot.plist`:
 </plist>
 ```
 
-Load it with `launchctl load ~/Library/LaunchAgents/com.daytrader.bot.plist`. launchd uses your Mac's local time, so Hour 9 is only 9:25 ET if your Mac is on Eastern time. Otherwise convert the hour (and the weekday, if the conversion crosses midnight). The Mac must be awake at that time.
+Load it with `launchctl load ~/Library/LaunchAgents/com.daytrader.bot.plist`. launchd uses your Mac's local time, so Hour 9 is only 9:25 ET if your Mac is on Eastern time. Otherwise convert the hour (and the weekday, if the conversion crosses midnight). The Mac must be awake at that time: `caffeinate -i` (above) keeps it awake while the bot runs, and `sudo pmset repeat wakeorpoweron MTWRF 09:15:00` wakes it each weekday at 9:15. Keep it plugged in with the lid open (a closed MacBook sleeps anyway unless an external display is attached).
 
 ## Windows: Task Scheduler
 
