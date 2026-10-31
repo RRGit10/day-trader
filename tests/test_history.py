@@ -75,14 +75,14 @@ def test_option_contracts_include_expired_and_paginate(tmp_path):
     h = make(tmp_path)
     exp = date(2026, 10, 30)
     pages = {
-        (AssetStatus.INACTIVE, None): NS(option_contracts=[contract("A100", 100.0, exp)], next_page_token="p2"),
-        (AssetStatus.INACTIVE, "p2"): NS(option_contracts=[contract("A101", 101.0, exp)], next_page_token=None),
-        (AssetStatus.ACTIVE, None): NS(option_contracts=[contract("A99", 99.0, exp)], next_page_token=None),
+        (AssetStatus.INACTIVE, None): NS(option_contracts=[contract("A261030C00100000", 100.0, exp)], next_page_token="p2"),
+        (AssetStatus.INACTIVE, "p2"): NS(option_contracts=[contract("A261030C00101000", 101.0, exp)], next_page_token=None),
+        (AssetStatus.ACTIVE, None): NS(option_contracts=[contract("A261030C00099000", 99.0, exp)], next_page_token=None),
     }
     h._trading.get_option_contracts.side_effect = lambda r: pages[(r.status, r.page_token)]
 
     got = h.option_contracts("A", "call", exp)
-    assert got == [("A99", 99.0), ("A100", 100.0), ("A101", 101.0)]
+    assert got == [("A261030C00099000", 99.0), ("A261030C00100000", 100.0), ("A261030C00101000", 101.0)]
     reqs = [c.args[0] for c in h._trading.get_option_contracts.call_args_list]
     assert {r.status for r in reqs} == {AssetStatus.INACTIVE, AssetStatus.ACTIVE}
     assert all(r.type == ContractType.CALL and r.underlying_symbols == ["A"] for r in reqs)
@@ -94,8 +94,9 @@ def test_option_contracts_include_expired_and_paginate(tmp_path):
 def test_expiries_after(tmp_path):
     h = make(tmp_path)
     h._trading.get_option_contracts.return_value = NS(
-        option_contracts=[contract("A1", 1.0, date(2026, 11, 6)), contract("A2", 2.0, date(2026, 10, 30)),
-                          contract("A3", 3.0, date(2026, 10, 30))],
+        option_contracts=[contract("A261106C00001000", 1.0, date(2026, 11, 6)),
+                          contract("A261030C00002000", 2.0, date(2026, 10, 30)),
+                          contract("A261030C00003000", 3.0, date(2026, 10, 30))],
         next_page_token=None,
     )
     assert h.expiries_after("A", DAY) == [date(2026, 10, 30), date(2026, 11, 6)]
@@ -104,13 +105,15 @@ def test_expiries_after(tmp_path):
 
 
 def test_adjusted_contracts_are_dropped_even_when_already_cached(tmp_path):
-    # Alpaca lists corporate-action contracts under a digit root; its bars API rejects them
+    # Alpaca lists corporate-action contracts under a digit root, before or after the ticker
     h = make(tmp_path)
-    near, only_adjusted = date(2026, 10, 30), date(2026, 11, 6)
+    near, only_adjusted, only_suffixed = date(2026, 10, 30), date(2026, 11, 6), date(2026, 11, 7)
     h._trading.get_option_contracts.return_value = NS(
         option_contracts=[contract("F261030C00013000", 13.0, near),
                           contract("1F261030C00013920", 13.92, near),
-                          contract("1F261106C00013920", 13.92, only_adjusted)],
+                          contract("F1261030C00013920", 13.92, near),
+                          contract("1F261106C00013920", 13.92, only_adjusted),
+                          contract("F1261107C00013920", 13.92, only_suffixed)],
         next_page_token=None,
     )
     for source in (h, make(tmp_path)):  # the second instance reads the raw rows from the cache

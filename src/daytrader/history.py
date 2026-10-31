@@ -28,6 +28,7 @@ CALLS_PER_MINUTE = 180
 DAY_OPEN, DAY_CLOSE = time(9, 30), time(16, 0)
 EXPIRY_LOOKAHEAD = timedelta(days=10)  # same expiry window as the live option chain
 RECENT_DAYS = 3  # empty answers for days this recent may just be data not published yet
+OCC_SUFFIX = 15  # yymmdd + C/P + 8-digit strike, after the root of an option symbol
 
 
 class RateLimiter:
@@ -66,8 +67,9 @@ class AlpacaHistorical:
     Every response is cached as one JSON file per request under `cache_dir` (file name =
     sha256 of the canonical request key); cached requests make no API call.
 
-    Alpaca lists corporate-action adjusted contracts under a digit root (1F for F). Their
-    bars can't be requested, so contract lookups drop any symbol not rooted at the underlying.
+    Alpaca lists corporate-action adjusted contracts under a digit root (1F for F, or CSGP1
+    for CSGP). They don't trade like standard contracts, and the bars of some can't be
+    requested, so contract lookups keep only symbols whose root is exactly the underlying.
     """
 
     def __init__(self, keys: Keys, cache_dir: Path, *,
@@ -165,10 +167,10 @@ class AlpacaHistorical:
     def option_contracts(self, underlying: str, kind: OptionType, expiry: date) -> list[tuple[str, float]]:
         key = {"m": "option_contracts", "underlying": underlying, "kind": kind, "expiry": expiry.isoformat()}
         rows = self._cached(key, lambda: self._contracts(underlying, kind, expiry, expiry))
-        return [(sym, strike) for sym, strike, _ in rows if sym.startswith(underlying)]
+        return [(sym, strike) for sym, strike, _ in rows if sym[:-OCC_SUFFIX] == underlying]
 
     def expiries_after(self, underlying: str, day: date) -> list[date]:
         gte, lte = day + timedelta(days=1), day + EXPIRY_LOOKAHEAD
         key = {"m": "expiries", "underlying": underlying, "gte": gte.isoformat(), "lte": lte.isoformat()}
         rows = self._cached(key, lambda: self._contracts(underlying, None, gte, lte))
-        return sorted({date.fromisoformat(exp) for sym, _, exp in rows if sym.startswith(underlying)})
+        return sorted({date.fromisoformat(exp) for sym, _, exp in rows if sym[:-OCC_SUFFIX] == underlying})
