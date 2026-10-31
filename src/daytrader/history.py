@@ -65,6 +65,9 @@ class AlpacaHistorical:
 
     Every response is cached as one JSON file per request under `cache_dir` (file name =
     sha256 of the canonical request key); cached requests make no API call.
+
+    Alpaca lists corporate-action adjusted contracts under a digit root (1F for F). Their
+    bars can't be requested, so contract lookups drop any symbol not rooted at the underlying.
     """
 
     def __init__(self, keys: Keys, cache_dir: Path, *,
@@ -162,10 +165,10 @@ class AlpacaHistorical:
     def option_contracts(self, underlying: str, kind: OptionType, expiry: date) -> list[tuple[str, float]]:
         key = {"m": "option_contracts", "underlying": underlying, "kind": kind, "expiry": expiry.isoformat()}
         rows = self._cached(key, lambda: self._contracts(underlying, kind, expiry, expiry))
-        return [(sym, strike) for sym, strike, _ in rows]
+        return [(sym, strike) for sym, strike, _ in rows if sym.startswith(underlying)]
 
     def expiries_after(self, underlying: str, day: date) -> list[date]:
         gte, lte = day + timedelta(days=1), day + EXPIRY_LOOKAHEAD
         key = {"m": "expiries", "underlying": underlying, "gte": gte.isoformat(), "lte": lte.isoformat()}
         rows = self._cached(key, lambda: self._contracts(underlying, None, gte, lte))
-        return sorted({date.fromisoformat(exp) for _, _, exp in rows})
+        return sorted({date.fromisoformat(exp) for sym, _, exp in rows if sym.startswith(underlying)})

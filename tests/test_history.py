@@ -103,6 +103,21 @@ def test_expiries_after(tmp_path):
     assert req.expiration_date_gte == date(2026, 10, 29)
 
 
+def test_adjusted_contracts_are_dropped_even_when_already_cached(tmp_path):
+    # Alpaca lists corporate-action contracts under a digit root; its bars API rejects them
+    h = make(tmp_path)
+    near, only_adjusted = date(2026, 10, 30), date(2026, 11, 6)
+    h._trading.get_option_contracts.return_value = NS(
+        option_contracts=[contract("F261030C00013000", 13.0, near),
+                          contract("1F261030C00013920", 13.92, near),
+                          contract("1F261106C00013920", 13.92, only_adjusted)],
+        next_page_token=None,
+    )
+    for source in (h, make(tmp_path)):  # the second instance reads the raw rows from the cache
+        assert source.option_contracts("F", "call", near) == [("F261030C00013000", 13.0)]
+        assert source.expiries_after("F", DAY) == [near]
+
+
 def test_trading_days(tmp_path):
     h = make(tmp_path)
     h._trading.get_calendar.return_value = [
