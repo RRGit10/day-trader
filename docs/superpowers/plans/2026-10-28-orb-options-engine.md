@@ -146,7 +146,7 @@
 - Produces:
   - `pick_contract(direction: Direction, quotes: Sequence[OptionQuote], today: date, cfg: ContractConfig) -> ContractPick`. Stages, in order; the first stage that leaves nothing sets `skip_reason`: (1) type matches (call for long, put for short) and `expiry > today`, keep only the **nearest** such expiry → `"no_expiry"`; (2) `delta is not None` and `delta_min ≤ |delta| ≤ delta_max` → `"no_delta_match"`; (3) `bid > 0`, `spread_pct ≤ max_spread_pct`, and (`open_interest is None` or `≥ min_open_interest`) → `"illiquid"`; (4) `ask ≤ max_price` → `"too_expensive"`. Choose `|delta|` closest to `delta_target`, tie → lower ask.
   - `contracts_for_budget(price: float, budget: float) -> int` = `floor(budget / (price * 100))`, `0` if `price <= 0`.
-  - `entry_limit_price(bid: float, ask: float) -> float` — mid rounded up to a valid tick ($0.01 if mid < 3.00, else $0.05), capped at the ask, so the limit is never below mid.
+  - `entry_limit_price(bid: float, ask: float) -> float` — mid rounded up to a valid tick ($0.01 if mid < 3.00, else $0.05), so the limit is never below mid and always on the grid (not capped at an off-grid ask; a buy limit above the ask fills at the ask).
 
 - [ ] **Step 1: Write the failing tests:** picks 0.66 over 0.62 and 0.71 (excluded); puts use |delta|; same-day expiry ignored, next expiry chosen even if a later one has a better delta; each skip reason produced by a minimal chain; `open_interest=None` passes liquidity (backtest); `contracts_for_budget(4.80, 500) == 1`, `(2.40, 500) == 2`, `(5.01, 500) == 0`; `entry_limit_price(2.40, 2.46) == 2.43`, `(4.10, 4.30) == 4.20`.
 - [ ] **Step 2–4:** fail → implement → pass.

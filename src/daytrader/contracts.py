@@ -60,10 +60,11 @@ def contracts_for_budget(price: float, budget: float) -> int:
 
 
 def entry_limit_price(bid: float, ask: float) -> float:
-    """Mid rounded up to a valid tick ($0.01 below $3.00, else $0.05), capped at the ask.
-    Rounding down could leave the limit below mid, where it often does not fill."""
-    ask_d = Decimal(str(ask))
-    mid = (Decimal(str(bid)) + ask_d) / 2
+    """Mid rounded up to a valid tick: $0.01 below $3.00, else $0.05.
+    Rounding down could leave the limit below mid, where it often does not fill. It is not
+    capped at the ask: quotes can sit off the tick grid, and a buy limit above the ask
+    still fills at the ask."""
+    mid = (Decimal(str(bid)) + Decimal(str(ask))) / 2
     tick = Decimal("0.01") if mid < Decimal("3.00") else Decimal("0.05")
     ticks = (mid / tick).quantize(Decimal("1"), rounding=ROUND_CEILING)
-    return float(min(ticks * tick, ask_d).quantize(Decimal("0.01")))
+    return float((ticks * tick).quantize(Decimal("0.01")))

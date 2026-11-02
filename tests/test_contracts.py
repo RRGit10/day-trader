@@ -107,6 +107,6 @@ def test_entry_limit_never_below_mid():
     assert entry_limit_price(3.17, 3.27) == 3.25
 
 
-def test_entry_limit_capped_at_ask():
-    # rounding up to the nickel grid would pass the ask; pay the ask instead
-    assert entry_limit_price(3.20, 3.22) == 3.22
+def test_entry_limit_stays_on_the_tick_grid_past_an_off_grid_ask():
+    # 3.22 is not a valid price on the $0.05 grid, so the limit stays at 3.25
+    assert entry_limit_price(3.20, 3.22) == 3.25
