@@ -33,7 +33,12 @@ def pick_contract(
     if not cands:
         return ContractPick(None, "no_delta_match")
 
-    # (3) liquidity
+    # (3) price cap, before liquidity so an unaffordable band reads as too_expensive
+    cands = [x for x in cands if x.ask <= cfg.max_price]
+    if not cands:
+        return ContractPick(None, "too_expensive")
+
+    # (4) liquidity
     cands = [
         x for x in cands
         if x.bid > 0
@@ -42,11 +47,6 @@ def pick_contract(
     ]
     if not cands:
         return ContractPick(None, "illiquid")
-
-    # (4) price cap
-    cands = [x for x in cands if x.ask <= cfg.max_price]
-    if not cands:
-        return ContractPick(None, "too_expensive")
 
     best = min(cands, key=lambda x: (abs(abs(x.delta) - cfg.delta_target), x.ask))
     return ContractPick(best, None)
