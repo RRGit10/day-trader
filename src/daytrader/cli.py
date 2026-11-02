@@ -53,7 +53,9 @@ def _day(text: str) -> date:
 
 def _hhmm(text: str) -> time:
     try:
-        return time.fromisoformat(text)
+        if len(text) != 5 or text[2] != ":":
+            raise ValueError
+        return time(int(text[:2]), int(text[3:]))
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected HH:MM, got {text!r}") from None
 
@@ -265,7 +267,7 @@ def _cmd_pending(args, settings: Settings, deps: Deps) -> int:
 
 
 def _cmd_near_misses(args, settings: Settings, deps: Deps) -> int:
-    """Today's breakouts that a filter blocked, each shown once until its failed rules change."""
+    """Today's breakouts blocked by another rule, each shown once until its failed rules change."""
     path = _journal_path(settings, args.mode)
     rows = []
     if path.is_file():
@@ -277,7 +279,7 @@ def _cmd_near_misses(args, settings: Settings, deps: Deps) -> int:
     shown = 0
     for m in near_miss_changes(rows):
         minute = m.ts.time().replace(second=0, microsecond=0)
-        if args.after is not None and minute <= args.after:
+        if args.since is not None and minute < args.since:
             continue
         print(f"{minute:%H:%M} {m.ticker} {m.direction}  "
               f"rules: {rules_line(m.direction, m.checks)}")
@@ -489,9 +491,9 @@ def _parser() -> argparse.ArgumentParser:
         s = sub.add_parser(name, help=f"{name} a pending ticket")
         s.add_argument("id")
     sub.add_parser("pending", help="list pending approval tickets")
-    s = sub.add_parser("near-misses", help="today's breakouts blocked by a filter, on change")
+    s = sub.add_parser("near-misses", help="today's breakouts blocked by another rule, on change")
     s.add_argument("--mode", choices=("approval", "bot"), default="approval")
-    s.add_argument("--after", type=_hhmm, help="only those after this ET time (HH:MM)")
+    s.add_argument("--since", type=_hhmm, help="only those at or after this ET minute (HH:MM)")
     s = sub.add_parser("day-log", help="one day's trades, tickets and skips as Markdown")
     s.add_argument("--mode", choices=("approval", "bot"), default="approval")
     s.add_argument("--date", type=_day, help="YYYY-MM-DD (default today)")

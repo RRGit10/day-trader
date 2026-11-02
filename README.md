@@ -87,7 +87,7 @@ daytrader run --mode approval     # leave running, start before 9:45 AM ET
 daytrader pending                 # list tickets
 daytrader approve <id>
 daytrader reject <id>
-daytrader near-misses             # breakouts a filter blocked today, with ✗ on each failed rule
+daytrader near-misses             # breakouts another rule blocked today, with ✗ on each failed rule
 daytrader day-log                 # today's trades, tickets and skips as Markdown
 ```
 

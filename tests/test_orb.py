@@ -146,3 +146,12 @@ def test_shorts_disabled():
     assert r.direction is None
     breakout = r.checks[2]
     assert not breakout.passed and breakout.detail == "shorts disabled"
+
+
+def test_filter_details_record_ema_period_and_exact_rsi_level():
+    # badges read these levels from the detail, so they must not be rounded
+    cfg = StrategyConfig(ema_period=12, rsi_long_min=60.04)
+    r = evaluate_orb("AAPL", flat_prior(), make_day([100, 100, 100, 101.0, 101.5]), cfg)
+    ema, rsi = r.checks[3].detail, r.checks[5].detail
+    assert " > ema12 " in ema
+    assert rsi.endswith(" > 60.04")

@@ -326,7 +326,7 @@
   - `scan` — affordability filter + current `evaluate_orb` per ticker, printed as a table (ticker, eligible/reason, each check ✓/✗).
   - `approve ID` / `reject ID` — `write_decision`; exit code 1 + message if unknown.
   - `pending` — prints pending tickets' `summary()`, then an indented `rules:` line from `rules_line()` with ✓/✗ for ORB breakout, 2-candle rule, EMA, VWAP and RSI (used by the skill). The EMA period and RSI level in the labels come from the engine's check details (`ema9`, `rsi 64.2 > 60.0`), never from the current config, which may have changed since the engine started.
-  - `near-misses [--mode approval|bot] [--after HH:MM]` — today's checks where the breakout passed but a filter failed, one line per ticker each time its set of failed rules changes, with the same `rules:` badges (used by the skill; information only).
+  - `near-misses [--mode approval|bot] [--since HH:MM]` — today's checks where the breakout passed but another rule failed (`--since` includes its own minute), one line per ticker each time its set of failed rules changes, with the same `rules:` badges (used by the skill; information only).
   - `day-log [--mode approval|bot] [--date YYYY-MM-DD]` — that day's journal as Markdown: day P&L, each trade (contract, entry/exit, hold time, return, rules at entry), tickets with their outcome, skipped signals, and near-miss counts. The trade-session skill saves it with a written review to `state/trade-journal/<date>-approval.md`.
   - `status [--mode bot]` — heartbeat age (flag "STALE" if > 60 s during market hours), open position, today's P&L and guard state.
   - `report --journal {bot,approval,backtest} [--start] [--end]`.

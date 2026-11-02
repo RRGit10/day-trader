@@ -163,8 +163,17 @@ def test_near_misses_lists_todays_changes_after_a_time(cfg, tmp_path, capsys):
         "10:05 INTC short  rules: ✓ ORB Breakout · ✓ 2 Candle Rule · ✓ 9 EMA Price Below · "
         "✓ VWAP Price Below · ✗ RSI Below 40\n"
     )
-    assert run(cfg, "near-misses", "--after", "10:00", deps=deps) == 0
+    # --since includes its own minute, so a near-miss written later in that minute still shows
+    assert run(cfg, "near-misses", "--since", "10:05", deps=deps) == 0
     assert capsys.readouterr().out.startswith("10:05 INTC short")
+    assert run(cfg, "near-misses", "--since", "10:00", deps=deps) == 0
+    assert capsys.readouterr().out.count("\n") == 2
+
+
+@pytest.mark.parametrize("bad", ["10:00+00:00", "10:00:30", "9:5", "25:00"])
+def test_near_misses_since_must_be_hh_mm(cfg, bad):
+    with pytest.raises(SystemExit):
+        run(cfg, "near-misses", "--since", bad)
 
 
 # ------------------------------------------------------------------- status
