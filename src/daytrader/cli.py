@@ -331,11 +331,14 @@ def _cmd_status(args, settings: Settings, deps: Deps) -> int:
 
 
 def _cmd_day_log(args, settings: Settings, deps: Deps) -> int:
+    day = args.date or deps.now().astimezone(ET).date()
+    if args.path:
+        print(settings.state_dir / "trade-journal" / f"{day.isoformat()}-{args.mode}.md")
+        return 0
     path = _journal_path(settings, args.mode)
     if not path.is_file():
         print(f"no journal at {path}")
         return 1
-    day = args.date or deps.now().astimezone(ET).date()
     journal = Journal(path)
     try:
         print(format_day_log(journal, day, args.mode, settings.strategy.entry_start), end="")
@@ -497,6 +500,8 @@ def _parser() -> argparse.ArgumentParser:
     s = sub.add_parser("day-log", help="one day's trades, tickets and skips as Markdown")
     s.add_argument("--mode", choices=("approval", "bot"), default="approval")
     s.add_argument("--date", type=_day, help="YYYY-MM-DD (default today)")
+    s.add_argument("--path", action="store_true",
+                   help="print where that day's journal file belongs, and exit")
     s = sub.add_parser("status", help="heartbeat, position, P&L, guard state")
     s.add_argument("--mode", choices=("approval", "bot"), default="bot")
     s = sub.add_parser("report", help="performance report from a journal")

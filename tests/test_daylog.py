@@ -97,6 +97,8 @@ def test_day_log_open_trade_and_empty_day(tmp_path):
 def test_overnight_trade_counts_on_the_day_it_closed(tmp_path):
     # matches `report` and `status`, which attribute P&L by closing date
     j = Journal(tmp_path / "j.db")
+    j.record_check(datetime(2026, 11, 2, 14, 59, 55, tzinfo=ET),
+                   OrbResult("SPY", True, "long", checks(), 1, 1, None, None))
     tid = j.open_trade(Position("SPY", "long", "SPY261106C00500000", 1, 2.0, 500.0, 499.0,
                                 datetime(2026, 11, 2, 15, 0, tzinfo=ET)))
     j.close_trade(tid, 2.5, "time", datetime(2026, 11, 3, 9, 35, tzinfo=ET))
@@ -106,3 +108,6 @@ def test_overnight_trade_counts_on_the_day_it_closed(tmp_path):
     assert "Day P&L: +$50.00 from 1 closed trade (1 win, 0 losses)" in closed_day
     assert "### 1. SPY long · +$50.00 · time" in opened_day
     assert "### 1. SPY long · +$50.00 · time" in closed_day
+    # the entry rules come from the opening day's checks on both days
+    assert closed_day.count("- Rules at entry: ✓ ORB Breakout") == 1
+    assert "not recorded" not in closed_day

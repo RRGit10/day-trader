@@ -82,7 +82,10 @@ def format_day_log(journal: Journal, day: date, mode: str, entry_start: time) ->
            "## Trades", ""]
     if trades:
         for n, t in enumerate(trades, 1):
-            out += _trade_lines(n, t, checks_rows) + [""]
+            # a trade held overnight was signaled on its opening day, not this one
+            opened = t.opened_at.date()
+            entry_checks = checks_rows if opened == day else journal.check_rows_on(opened)
+            out += _trade_lines(n, t, entry_checks) + [""]
     else:
         out += ["None.", ""]
 

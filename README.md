@@ -91,7 +91,7 @@ daytrader near-misses             # breakouts another rule blocked today, with â
 daytrader day-log                 # today's trades, tickets and skips as Markdown
 ```
 
-At the end of a session the trade-session skill saves the day log plus a short review to `state/trade-journal/<date>-approval.md`. A later session the same day refreshes the log and adds its own review below the earlier ones.
+At the end of a session the trade-session skill saves the day log plus a short review to `state/trade-journal/<date>-approval.md` (`daytrader day-log --path` prints the exact location). A later session the same day refreshes the log and adds its own review below the earlier ones.
 
 ### Bot mode (fully automatic, paper)
 

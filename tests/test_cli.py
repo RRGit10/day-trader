@@ -249,6 +249,13 @@ def test_day_log_defaults_to_today_and_approval(cfg, tmp_path, capsys):
     assert capsys.readouterr().out.startswith("# Trade journal: 2026-10-28 (bot)\n")
 
 
+def test_day_log_path_is_under_the_configs_state_dir(cfg, tmp_path, capsys):
+    # works before any journal exists, from any working directory
+    assert run(cfg, "day-log", "--path", deps=cli.Deps(now=lambda: NOW)) == 0
+    expected = tmp_path / "state" / "trade-journal" / "2026-10-29-approval.md"
+    assert capsys.readouterr().out == f"{expected}\n"
+
+
 # ----------------------------------------------------------------- backtest
 def hist_deps(hist, now=NOW):
     return cli.Deps(historical=lambda keys, cache: hist, now=lambda: now)
