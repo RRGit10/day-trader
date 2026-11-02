@@ -60,7 +60,7 @@ def test_day_log_trades_tickets_skips_and_near_misses(tmp_path):
     j = build(tmp_path)
     out = format_day_log(j, DAY, "approval", time(9, 55))
     assert out.startswith("# Trade journal: 2026-11-02 (approval)\n")
-    assert "Day P&L: +$76.00 · 1 trade (1 win, 0 losses) · 3 tickets" in out
+    assert "Day P&L: +$76.00 from 1 closed trade (1 win, 0 losses) · 3 tickets" in out
     assert "### 1. IWM long · +$76.00 · take_profit" in out
     assert "- Contract: 2× IWM261103C00281000" in out
     assert "- Entry: 10:05:46 ET at $2.11 (stock $282.15)" in out
@@ -81,7 +81,7 @@ def test_day_log_open_trade_and_empty_day(tmp_path):
     j = Journal(tmp_path / "j.db")
     assert format_day_log(j, DAY, "bot", time(9, 55)) == (
         "# Trade journal: 2026-11-02 (bot)\n\n"
-        "Day P&L: $0.00 · 0 trades (0 wins, 0 losses) · 0 tickets\n\n"
+        "Day P&L: $0.00 from 0 closed trades (0 wins, 0 losses) · 0 tickets\n\n"
         "## Trades\n\nNone.\n\n"
         "## Skipped signals\n\nNone.\n\n"
         "## Near-misses\n\nNone.\n"
@@ -91,3 +91,18 @@ def test_day_log_open_trade_and_empty_day(tmp_path):
     assert "### 1. SPY short · open" in out
     assert "- Exit: still open" in out
     assert "- Rules at entry: not recorded" in out
+    assert "Day P&L: $0.00 from 0 closed trades" in out
+
+
+def test_overnight_trade_counts_on_the_day_it_closed(tmp_path):
+    # matches `report` and `status`, which attribute P&L by closing date
+    j = Journal(tmp_path / "j.db")
+    tid = j.open_trade(Position("SPY", "long", "SPY261106C00500000", 1, 2.0, 500.0, 499.0,
+                                datetime(2026, 11, 2, 15, 0, tzinfo=ET)))
+    j.close_trade(tid, 2.5, "time", datetime(2026, 11, 3, 9, 35, tzinfo=ET))
+    opened_day = format_day_log(j, DAY, "bot", time(9, 55))
+    closed_day = format_day_log(j, date(2026, 11, 3), "bot", time(9, 55))
+    assert "Day P&L: $0.00 from 0 closed trades" in opened_day
+    assert "Day P&L: +$50.00 from 1 closed trade (1 win, 0 losses)" in closed_day
+    assert "### 1. SPY long · +$50.00 · time" in opened_day
+    assert "### 1. SPY long · +$50.00 · time" in closed_day

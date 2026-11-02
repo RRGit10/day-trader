@@ -65,17 +65,18 @@ def _outcome(ts: datetime, payload: dict, status: str, trades, skips) -> str:
 
 
 def format_day_log(journal: Journal, day: date, mode: str, entry_start: time) -> str:
-    trades = journal.trades_opened_on(day)
+    trades = journal.trade_records_on(day)
     tickets = journal.tickets_on(day)
     skips = journal.skips_on(day)
     checks_rows = journal.check_rows_on(day)
 
-    closed = [t for t in trades if t.closed_at]
+    # P&L belongs to the day a trade closed, as in `report` and `status`
+    closed = [t for t in trades if t.closed_at and t.closed_at.date() == day]
     pnl = sum(t.pnl for t in closed)
     wins = sum(1 for t in closed if t.pnl > 0)
     losses = sum(1 for t in closed if t.pnl < 0)
     out = [f"# Trade journal: {day.isoformat()} ({mode})", "",
-           f"Day P&L: {_money(pnl, sign=True)} · {_plural(len(trades), 'trade')} "
+           f"Day P&L: {_money(pnl, sign=True)} from {_plural(len(closed), 'closed trade')} "
            f"({_plural(wins, 'win')}, {losses} {'loss' if losses == 1 else 'losses'}) · "
            f"{_plural(len(tickets), 'ticket')}", "",
            "## Trades", ""]
