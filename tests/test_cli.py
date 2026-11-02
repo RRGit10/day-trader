@@ -228,6 +228,18 @@ def test_report_prints_summary(cfg, tmp_path, capsys):
     assert "Trades: 0" in out and "Past results" in out
 
 
+def test_day_log_defaults_to_today_and_approval(cfg, tmp_path, capsys):
+    deps = cli.Deps(now=lambda: NOW)
+    assert run(cfg, "day-log", deps=deps) == 1
+    assert "no journal at" in capsys.readouterr().out
+    Journal(tmp_path / "state" / "journal-approval.db").close()
+    assert run(cfg, "day-log", deps=deps) == 0
+    assert capsys.readouterr().out.startswith("# Trade journal: 2026-10-29 (approval)\n")
+    Journal(tmp_path / "state" / "journal-bot.db").close()
+    assert run(cfg, "day-log", "--mode", "bot", "--date", "2026-10-28", deps=deps) == 0
+    assert capsys.readouterr().out.startswith("# Trade journal: 2026-10-28 (bot)\n")
+
+
 # ----------------------------------------------------------------- backtest
 def hist_deps(hist, now=NOW):
     return cli.Deps(historical=lambda keys, cache: hist, now=lambda: now)
