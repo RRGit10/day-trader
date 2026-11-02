@@ -144,7 +144,7 @@
 **Interfaces:**
 - Consumes: `OptionQuote`, `ContractPick`, `ContractConfig`.
 - Produces:
-  - `pick_contract(direction: Direction, quotes: Sequence[OptionQuote], today: date, cfg: ContractConfig) -> ContractPick`. Stages, in order; the first stage that leaves nothing sets `skip_reason`: (1) type matches (call for long, put for short) and `expiry > today`, keep only the **nearest** such expiry → `"no_expiry"`; (2) `delta is not None` and `delta_min ≤ |delta| ≤ delta_max` → `"no_delta_match"`; (3) `bid > 0`, `spread_pct ≤ max_spread_pct`, and (`open_interest is None` or `≥ min_open_interest`) → `"illiquid"`; (4) `ask ≤ max_price` → `"too_expensive"`. Choose `|delta|` closest to `delta_target`, tie → lower ask.
+  - `pick_contract(direction: Direction, quotes: Sequence[OptionQuote], today: date, cfg: ContractConfig) -> ContractPick`. Stages, in order; the first stage that leaves nothing sets `skip_reason`: (1) type matches (call for long, put for short) and `expiry > today`, keep only the **nearest** such expiry → `"no_expiry"`; (2) `delta is not None` and `delta_min ≤ |delta| ≤ delta_max` → `"no_delta_match"`; (3) `ask ≤ max_price` → `"too_expensive"`; (4) `bid > 0`, `spread_pct ≤ max_spread_pct`, and (`open_interest is None` or `≥ min_open_interest`) → `"illiquid"`. Choose `|delta|` closest to `delta_target`, tie → lower ask.
   - `contracts_for_budget(price: float, budget: float) -> int` = `floor(budget / (price * 100))`, `0` if `price <= 0`.
   - `entry_limit_price(bid: float, ask: float) -> float` — mid rounded to a valid tick: $0.01 if mid < 3.00, else $0.05.
 

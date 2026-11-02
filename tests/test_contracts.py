@@ -80,6 +80,17 @@ def test_too_expensive():
     assert pick.skip_reason == "too_expensive"
 
 
+def test_too_expensive_reported_before_illiquid():
+    # wide spread and low OI, but the price alone rules it out
+    pick = pick_contract("long", [q(bid=9.00, ask=10.00, oi=100)], TODAY, CFG)
+    assert pick.skip_reason == "too_expensive"
+
+
+def test_illiquid_when_only_affordable_contract_is_illiquid():
+    quotes = [q("RICH", bid=5.95, ask=6.00), q("THIN", delta=0.66, oi=100)]
+    assert pick_contract("long", quotes, TODAY, CFG).skip_reason == "illiquid"
+
+
 def test_max_price_boundary_inclusive():
     pick = pick_contract("long", [q(bid=4.95, ask=5.00)], TODAY, replace(CFG))
     assert pick.skip_reason is None
