@@ -256,7 +256,7 @@ def _cmd_pending(args, settings: Settings, deps: Deps) -> int:
             continue
         created = ticket.created_at.astimezone(ET)
         print(f"{ticket.id}  created {created:%H:%M:%S} ET  {ticket.summary()}")
-        print(f"    rules: {ticket.rules_line(settings.strategy)}")
+        print(f"    rules: {ticket.rules_line()}")
         shown += 1
     if not shown:
         print("No pending tickets.")
@@ -279,7 +279,7 @@ def _cmd_near_misses(args, settings: Settings, deps: Deps) -> int:
         if args.after is not None and minute <= args.after:
             continue
         print(f"{minute:%H:%M} {m.ticker} {m.direction}  "
-              f"rules: {rules_line(m.direction, m.checks, settings.strategy)}")
+              f"rules: {rules_line(m.direction, m.checks)}")
         shown += 1
     if not shown:
         print("No near-misses.")

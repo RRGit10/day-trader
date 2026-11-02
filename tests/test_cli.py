@@ -11,7 +11,6 @@ from daytrader import cli
 from daytrader.approval import Ticket
 from daytrader.broker import PaperLockError
 from daytrader.clock import MarketHours
-from daytrader.config import StrategyConfig
 from daytrader.journal import Journal
 from daytrader.models import ET, Bar, Check, OptionQuote, OrbResult, Position
 from fakes import FakeClock, FakeData, FakeHistorical
@@ -120,7 +119,7 @@ def test_pending_lists_summaries_with_created_time(cfg, tmp_path, capsys):
     assert run(cfg, "pending", deps=deps) == 0
     out = capsys.readouterr().out
     assert f"t1  created 10:00:00 ET  {t.summary()}" in out
-    assert f"\n    rules: {t.rules_line(StrategyConfig())}\n" in out
+    assert f"\n    rules: {t.rules_line()}\n" in out
 
 
 def test_pending_hides_tickets_older_than_2_minutes(cfg, tmp_path, capsys):
@@ -142,8 +141,10 @@ def test_near_misses_lists_todays_changes_after_a_time(cfg, tmp_path, capsys):
     assert run(cfg, "near-misses", deps=deps) == 0
     assert capsys.readouterr().out == "No near-misses.\n"
 
+    details = {"ema": "close 1.50 < ema9 1.60", "rsi": "rsi 42.5 < 40.0"}
+
     def checks(**failed):
-        return tuple(Check(n, not failed.get(n, False), "")
+        return tuple(Check(n, not failed.get(n, False), details.get(n, ""))
                      for n in ("range", "window", "breakout", "ema", "vwap", "rsi"))
 
     j = Journal(tmp_path / "state" / "journal-approval.db")
@@ -156,10 +157,9 @@ def test_near_misses_lists_todays_changes_after_a_time(cfg, tmp_path, capsys):
     j.close()
 
     assert run(cfg, "near-misses", deps=deps) == 0
-    iwm = Ticket.from_dict({**make_ticket().to_dict(), "checks": [
-        {"name": c.name, "passed": c.passed, "detail": ""} for c in checks(ema=True)]})
     assert capsys.readouterr().out == (
-        f"10:00 IWM long  rules: {iwm.rules_line(StrategyConfig())}\n"
+        "10:00 IWM long  rules: ✓ ORB Breakout · ✓ 2 Candle Rule · ✗ 9 EMA Price Above · "
+        "✓ VWAP Price Above · ✓ RSI Above 40\n"
         "10:05 INTC short  rules: ✓ ORB Breakout · ✓ 2 Candle Rule · ✓ 9 EMA Price Below · "
         "✓ VWAP Price Below · ✗ RSI Below 40\n"
     )

@@ -2,7 +2,6 @@ import json
 from datetime import date, datetime, time
 
 from daytrader.approval import AutoApprover, FileApprover, Ticket, write_decision
-from daytrader.config import StrategyConfig
 from daytrader.models import ET, Check
 from tests.fakes import FakeClock
 
@@ -34,32 +33,43 @@ def test_summary():
     )
 
 
-ALL_PASS = tuple(Check(n, True, "") for n in ("range", "window", "breakout", "ema", "vwap", "rsi"))
+def _checks(ema="close 282.15 > ema9 281.28", rsi="rsi 64.2 > 60.0"):
+    return (Check("range", True, ""), Check("window", True, ""), Check("breakout", True, ""),
+            Check("ema", True, ema), Check("vwap", True, ""), Check("rsi", True, rsi))
 
 
 def test_rules_line_long():
-    t = Ticket(**{**make_ticket().__dict__, "checks": ALL_PASS})
-    assert t.rules_line(StrategyConfig()) == (
+    t = Ticket(**{**make_ticket().__dict__, "checks": _checks()})
+    assert t.rules_line() == (
         "✓ ORB Breakout · ✓ 2 Candle Rule · ✓ 9 EMA Price Above · "
         "✓ VWAP Price Above · ✓ RSI Above 60"
     )
 
 
-def test_rules_line_short_uses_config_thresholds():
-    t = Ticket(**{**make_ticket().__dict__, "direction": "short", "checks": ALL_PASS})
-    cfg = StrategyConfig(ema_period=20, rsi_short_max=35.5)
-    assert t.rules_line(cfg) == (
+def test_rules_line_takes_levels_from_the_engines_check_details():
+    # the engine ran with EMA 20 / RSI 35.5, whatever config.toml says now
+    checks = _checks(ema="close 63.26 < ema20 63.72", rsi="rsi 31.0 < 35.5")
+    t = Ticket(**{**make_ticket().__dict__, "direction": "short", "checks": checks})
+    assert t.rules_line() == (
         "✓ ORB Breakout · ✓ 2 Candle Rule · ✓ 20 EMA Price Below · "
         "✓ VWAP Price Below · ✓ RSI Below 35.5"
     )
 
 
+def test_rules_line_omits_levels_a_detail_does_not_record():
+    # tickets written before the EMA period was in the detail
+    checks = _checks(ema="close 282.15 > ema 281.28", rsi="insufficient data for rsi")
+    t = Ticket(**{**make_ticket().__dict__, "checks": checks})
+    assert "✓ EMA Price Above" in t.rules_line()
+    assert t.rules_line().endswith("✓ RSI Above")
+
+
 def test_rules_line_marks_failed_and_missing_checks():
     # ORB needs both range and window; there is no breakout or vwap check here
     checks = (Check("range", True, ""), Check("window", False, ""),
-              Check("ema", False, ""), Check("rsi", True, ""))
+              Check("ema", False, "close 1.00 > ema9 1.10"), Check("rsi", True, "rsi 61.0 > 60.0"))
     t = Ticket(**{**make_ticket().__dict__, "checks": checks})
-    assert t.rules_line(StrategyConfig()) == (
+    assert t.rules_line() == (
         "✗ ORB Breakout · ✗ 2 Candle Rule · ✗ 9 EMA Price Above · "
         "✗ VWAP Price Above · ✓ RSI Above 60"
     )

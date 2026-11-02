@@ -103,7 +103,8 @@ def evaluate_orb(
             checks.append(Check("ema", False, "insufficient data for ema"))
         else:
             ok = close > ema_v if long else close < ema_v
-            checks.append(Check("ema", ok, f"close {close:.2f} {'>' if long else '<'} ema {ema_v:.2f}"))
+            checks.append(Check("ema", ok, f"close {close:.2f} {'>' if long else '<'} "
+                                           f"ema{cfg.ema_period} {ema_v:.2f}"))
 
         vwap_v = session_vwap(today_bars)[-1]
         ok = close > vwap_v if long else close < vwap_v

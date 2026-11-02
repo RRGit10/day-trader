@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -10,7 +11,6 @@ from pathlib import Path
 from typing import Callable, Literal, Protocol, Sequence
 
 from .clock import Clock
-from .config import StrategyConfig
 from .models import Check, Direction
 
 Decision = Literal["approved", "rejected", "expired"]
@@ -109,22 +109,26 @@ class Ticket:
             f"or {self.flat_time.strftime('%H:%M')}."
         )
 
-    def rules_line(self, cfg: StrategyConfig) -> str:
-        return rules_line(self.direction, self.checks, cfg)
+    def rules_line(self) -> str:
+        return rules_line(self.direction, self.checks)
 
 
-def rules_line(direction: Direction, checks: Sequence[Check], cfg: StrategyConfig) -> str:
-    """The entry rules as ✓/✗ badges; a check missing from `checks` shows as ✗."""
-    passed = {c.name: c.passed for c in checks}
+def rules_line(direction: Direction, checks: Sequence[Check]) -> str:
+    """The entry rules as ✓/✗ badges; a check missing from `checks` shows as ✗.
+    The EMA period and RSI level come from the engine's own check details, not the
+    current config, which may have changed since; when a detail lacks them they're left out."""
+    by_name = {c.name: c for c in checks}
+    passed = {name: c.passed for name, c in by_name.items()}
     long = direction == "long"
     side = "Above" if long else "Below"
-    rsi_level = cfg.rsi_long_min if long else cfg.rsi_short_max
+    ema = re.search(r"\bema(\d+)\b", by_name["ema"].detail) if "ema" in by_name else None
+    rsi = re.search(r"\brsi [\d.]+ [<>] ([\d.]+)$", by_name["rsi"].detail) if "rsi" in by_name else None
     rules = [
         ("ORB Breakout", passed.get("range", False) and passed.get("window", False)),
         ("2 Candle Rule", passed.get("breakout", False)),
-        (f"{cfg.ema_period} EMA Price {side}", passed.get("ema", False)),
+        (f"{ema.group(1) + ' ' if ema else ''}EMA Price {side}", passed.get("ema", False)),
         (f"VWAP Price {side}", passed.get("vwap", False)),
-        (f"RSI {side} {rsi_level:g}", passed.get("rsi", False)),
+        (f"RSI {side}{f' {float(rsi.group(1)):g}' if rsi else ''}", passed.get("rsi", False)),
     ]
     return " · ".join(f"{'✓' if ok else '✗'} {label}" for label, ok in rules)
 
