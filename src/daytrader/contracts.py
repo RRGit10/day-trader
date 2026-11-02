@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from datetime import date
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, Decimal
 
 from daytrader.config import ContractConfig
 from daytrader.models import ContractPick, Direction, OptionQuote
@@ -60,8 +60,10 @@ def contracts_for_budget(price: float, budget: float) -> int:
 
 
 def entry_limit_price(bid: float, ask: float) -> float:
-    """Mid rounded half-up to a valid tick: $0.01 below $3.00, else $0.05."""
-    mid = (Decimal(str(bid)) + Decimal(str(ask))) / 2
+    """Mid rounded up to a valid tick ($0.01 below $3.00, else $0.05), capped at the ask.
+    Rounding down could leave the limit below mid, where it often does not fill."""
+    ask_d = Decimal(str(ask))
+    mid = (Decimal(str(bid)) + ask_d) / 2
     tick = Decimal("0.01") if mid < Decimal("3.00") else Decimal("0.05")
-    ticks = (mid / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return float((ticks * tick).quantize(Decimal("0.01")))
+    ticks = (mid / tick).quantize(Decimal("1"), rounding=ROUND_CEILING)
+    return float(min(ticks * tick, ask_d).quantize(Decimal("0.01")))
