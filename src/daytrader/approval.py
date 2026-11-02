@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Callable, Literal, Protocol
+from typing import Callable, Literal, Protocol, Sequence
 
 from .clock import Clock
 from .models import Check, Direction
@@ -107,6 +108,29 @@ class Ticket:
             f"stock {_money(self.stock_stop)} / {_money(self.stock_target)}, "
             f"or {self.flat_time.strftime('%H:%M')}."
         )
+
+    def rules_line(self) -> str:
+        return rules_line(self.direction, self.checks)
+
+
+def rules_line(direction: Direction, checks: Sequence[Check]) -> str:
+    """The entry rules as ✓/✗ badges; a check missing from `checks` shows as ✗.
+    The EMA period and RSI level come from the engine's own check details, not the
+    current config, which may have changed since; when a detail lacks them they're left out."""
+    by_name = {c.name: c for c in checks}
+    passed = {name: c.passed for name, c in by_name.items()}
+    long = direction == "long"
+    side = "Above" if long else "Below"
+    ema = re.search(r"\bema(\d+)\b", by_name["ema"].detail) if "ema" in by_name else None
+    rsi = re.search(r"\brsi [\d.]+ [<>] ([\d.]+)$", by_name["rsi"].detail) if "rsi" in by_name else None
+    rules = [
+        ("ORB Breakout", passed.get("range", False) and passed.get("window", False)),
+        ("2 Candle Rule", passed.get("breakout", False)),
+        (f"{ema.group(1) + ' ' if ema else ''}EMA Price {side}", passed.get("ema", False)),
+        (f"VWAP Price {side}", passed.get("vwap", False)),
+        (f"RSI {side}{f' {float(rsi.group(1)):g}' if rsi else ''}", passed.get("rsi", False)),
+    ]
+    return " · ".join(f"{'✓' if ok else '✗'} {label}" for label, ok in rules)
 
 
 class Approver(Protocol):

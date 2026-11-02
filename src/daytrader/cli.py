@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .approval import AutoApprover, FileApprover, Ticket, write_decision
+from .approval import AutoApprover, FileApprover, Ticket, rules_line, write_decision
 from .backtest import run_backtest
 from .broker import PaperLockError, make_broker
 from .clock import STARTUP_RETRY_EVERY, SystemClock, retry_until, startup_deadline
@@ -23,7 +23,7 @@ from .history import AlpacaHistorical
 from .journal import Journal
 from .models import ET
 from .orb import evaluate_orb
-from .report import format_summary, summarize
+from .report import format_summary, near_miss_changes, summarize
 from .session import Session
 
 BACKTEST_EARLIEST = date(2024, 2, 1)
@@ -48,6 +48,15 @@ def _day(text: str) -> date:
         return date.fromisoformat(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {text!r}") from None
+
+
+def _hhmm(text: str) -> time:
+    try:
+        if len(text) != 5 or text[2] != ":":
+            raise ValueError
+        return time(int(text[:2]), int(text[3:]))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected HH:MM, got {text!r}") from None
 
 
 def _tickers(text: str) -> list[str]:
@@ -249,9 +258,33 @@ def _cmd_pending(args, settings: Settings, deps: Deps) -> int:
             continue
         created = ticket.created_at.astimezone(ET)
         print(f"{ticket.id}  created {created:%H:%M:%S} ET  {ticket.summary()}")
+        print(f"    rules: {ticket.rules_line()}")
         shown += 1
     if not shown:
         print("No pending tickets.")
+    return 0
+
+
+def _cmd_near_misses(args, settings: Settings, deps: Deps) -> int:
+    """Today's breakouts blocked by another rule, each shown once until its failed rules change."""
+    path = _journal_path(settings, args.mode)
+    rows = []
+    if path.is_file():
+        journal = Journal(path)
+        try:
+            rows = journal.check_rows_on(deps.now().astimezone(ET).date())
+        finally:
+            journal.close()
+    shown = 0
+    for m in near_miss_changes(rows):
+        minute = m.ts.time().replace(second=0, microsecond=0)
+        if args.since is not None and minute < args.since:
+            continue
+        print(f"{minute:%H:%M} {m.ticker} {m.direction}  "
+              f"rules: {rules_line(m.direction, m.checks)}")
+        shown += 1
+    if not shown:
+        print("No near-misses.")
     return 0
 
 
@@ -443,6 +476,9 @@ def _parser() -> argparse.ArgumentParser:
         s = sub.add_parser(name, help=f"{name} a pending ticket")
         s.add_argument("id")
     sub.add_parser("pending", help="list pending approval tickets")
+    s = sub.add_parser("near-misses", help="today's breakouts blocked by another rule, on change")
+    s.add_argument("--mode", choices=("approval", "bot"), default="approval")
+    s.add_argument("--since", type=_hhmm, help="only those at or after this ET minute (HH:MM)")
     s = sub.add_parser("status", help="heartbeat, position, P&L, guard state")
     s.add_argument("--mode", choices=("approval", "bot"), default="bot")
     s = sub.add_parser("report", help="performance report from a journal")
@@ -475,6 +511,8 @@ def main(argv: Sequence[str] | None = None, deps: Deps | None = None) -> int:
             return _cmd_decide(args, settings, "approve" if cmd == "approve" else "reject")
         if cmd == "pending":
             return _cmd_pending(args, settings, deps)
+        if cmd == "near-misses":
+            return _cmd_near_misses(args, settings, deps)
         if cmd == "status":
             return _cmd_status(args, settings, deps)
         if cmd == "report":

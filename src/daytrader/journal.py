@@ -6,7 +6,7 @@ import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 
-from .models import ET, ClosedTrade, OrbResult, Position
+from .models import ET, Check, ClosedTrade, Direction, OrbResult, Position
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS checks (
@@ -174,6 +174,21 @@ class Journal:
             "SELECT ts, ticker, triggered, checks_json FROM checks ORDER BY id"
         ).fetchall()
         return [(_parse(r[0]), r[1], bool(r[2]), json.loads(r[3])) for r in rows]
+
+    def check_rows_on(
+        self, day: date
+    ) -> list[tuple[datetime, str, bool, Direction | None, tuple[Check, ...]]]:
+        rows = self._conn.execute(
+            "SELECT ts, ticker, triggered, direction, checks_json FROM checks ORDER BY id"
+        ).fetchall()
+        out = []
+        for ts, ticker, triggered, direction, checks_json in rows:
+            when = _parse(ts)
+            if when.date() == day:
+                checks = tuple(Check(c["name"], c["passed"], c["detail"])
+                               for c in json.loads(checks_json))
+                out.append((when, ticker, bool(triggered), direction, checks))
+        return out
 
     def skip_rows(self) -> list[tuple[datetime, str, str]]:
         rows = self._conn.execute("SELECT ts, ticker, reason FROM skips ORDER BY id").fetchall()

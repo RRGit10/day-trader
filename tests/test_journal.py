@@ -75,6 +75,23 @@ def test_checks_roundtrip(tmp_path):
     ])]
 
 
+def test_check_rows_on_filters_by_et_date_with_direction(tmp_path):
+    j = Journal(tmp_path / "j.db")
+    checks = (Check("breakout", True, ""), Check("ema", False, ""))
+
+    def rec(ts, direction):
+        j.record_check(ts, OrbResult("AAPL", False, direction, checks, 200.0, 196.0, None, None))
+
+    day = datetime(2026, 10, 28, 10, 0, tzinfo=ET)
+    rec(day, "short")
+    rec(datetime(2026, 10, 29, 10, 0, tzinfo=ET), "long")
+    rec(day.replace(hour=10, minute=5), None)
+    assert j.check_rows_on(date(2026, 10, 28)) == [
+        (day, "AAPL", False, "short", checks),
+        (day.replace(minute=5), "AAPL", False, None, checks),
+    ]
+
+
 def test_skips_tickets_events_and_reopen(tmp_path):
     path = tmp_path / "j.db"
     ts = datetime(2026, 10, 28, 9, 40, tzinfo=ET)

@@ -325,7 +325,8 @@
   - `run --mode {approval,bot}` — builds Session with `AlpacaData(approval or bot keys)`, `make_broker`, `Journal(state/journal-<mode>.db)`, `FileApprover` (approval) / `AutoApprover` (bot), `SystemClock`; refuses to start if another `run` for that mode holds `state/run-<mode>.lock`.
   - `scan` — affordability filter + current `evaluate_orb` per ticker, printed as a table (ticker, eligible/reason, each check ✓/✗).
   - `approve ID` / `reject ID` — `write_decision`; exit code 1 + message if unknown.
-  - `pending` — prints pending tickets' `summary()` (used by the skill).
+  - `pending` — prints pending tickets' `summary()`, then an indented `rules:` line from `rules_line()` with ✓/✗ for ORB breakout, 2-candle rule, EMA, VWAP and RSI (used by the skill). The EMA period and RSI level in the labels come from the engine's check details (`ema9`, `rsi 64.2 > 60.0`), never from the current config, which may have changed since the engine started.
+  - `near-misses [--mode approval|bot] [--since HH:MM]` — today's checks where the breakout passed but another rule failed (`--since` includes its own minute), one line per ticker each time its set of failed rules changes, with the same `rules:` badges (used by the skill; information only).
   - `status [--mode bot]` — heartbeat age (flag "STALE" if > 60 s during market hours), open position, today's P&L and guard state.
   - `report --journal {bot,approval,backtest} [--start] [--end]`.
   - `backtest [--start YYYY-MM-DD] [--end] [--tickers A,B]` — default last 12 months, never before 2024-02-01 (earlier start → clamp with a message); journal `state/journal-backtest.db` (recreated each run); prints `format_summary`.

@@ -12,7 +12,7 @@ from daytrader.approval import Ticket
 from daytrader.broker import PaperLockError
 from daytrader.clock import MarketHours
 from daytrader.journal import Journal
-from daytrader.models import ET, Bar, Check, OptionQuote, Position
+from daytrader.models import ET, Bar, Check, OptionQuote, OrbResult, Position
 from fakes import FakeClock, FakeData, FakeHistorical
 
 NOW = datetime(2026, 10, 29, 10, 0, tzinfo=ET)  # Thursday
@@ -117,7 +117,9 @@ def test_pending_lists_summaries_with_created_time(cfg, tmp_path, capsys):
     t = make_ticket()
     (pend / "t1.json").write_text(json.dumps(t.to_dict()))
     assert run(cfg, "pending", deps=deps) == 0
-    assert f"t1  created 10:00:00 ET  {t.summary()}" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert f"t1  created 10:00:00 ET  {t.summary()}" in out
+    assert f"\n    rules: {t.rules_line()}\n" in out
 
 
 def test_pending_hides_tickets_older_than_2_minutes(cfg, tmp_path, capsys):
@@ -132,6 +134,46 @@ def test_pending_hides_tickets_older_than_2_minutes(cfg, tmp_path, capsys):
     assert "new  created" in out and "old" not in out
     assert run(cfg, "pending", deps=cli.Deps(now=lambda: NOW + timedelta(minutes=5))) == 0
     assert "No pending tickets." in capsys.readouterr().out
+
+
+def test_near_misses_lists_todays_changes_after_a_time(cfg, tmp_path, capsys):
+    deps = cli.Deps(now=lambda: NOW + timedelta(minutes=10))
+    assert run(cfg, "near-misses", deps=deps) == 0
+    assert capsys.readouterr().out == "No near-misses.\n"
+
+    details = {"ema": "close 1.50 < ema9 1.60", "rsi": "rsi 42.5 < 40.0"}
+
+    def checks(**failed):
+        return tuple(Check(n, not failed.get(n, False), details.get(n, ""))
+                     for n in ("range", "window", "breakout", "ema", "vwap", "rsi"))
+
+    j = Journal(tmp_path / "state" / "journal-approval.db")
+    for ts, tk, direction, cs in (
+        (NOW - timedelta(days=1), "SPY", "long", checks(vwap=True)),  # yesterday
+        (NOW, "IWM", "long", checks(ema=True)),
+        (NOW + timedelta(minutes=5), "INTC", "short", checks(rsi=True)),
+    ):
+        j.record_check(ts, OrbResult(tk, False, direction, cs, 2.0, 1.0, None, None))
+    j.close()
+
+    assert run(cfg, "near-misses", deps=deps) == 0
+    assert capsys.readouterr().out == (
+        "10:00 IWM long  rules: ✓ ORB Breakout · ✓ 2 Candle Rule · ✗ 9 EMA Price Above · "
+        "✓ VWAP Price Above · ✓ RSI Above 40\n"
+        "10:05 INTC short  rules: ✓ ORB Breakout · ✓ 2 Candle Rule · ✓ 9 EMA Price Below · "
+        "✓ VWAP Price Below · ✗ RSI Below 40\n"
+    )
+    # --since includes its own minute, so a near-miss written later in that minute still shows
+    assert run(cfg, "near-misses", "--since", "10:05", deps=deps) == 0
+    assert capsys.readouterr().out.startswith("10:05 INTC short")
+    assert run(cfg, "near-misses", "--since", "10:00", deps=deps) == 0
+    assert capsys.readouterr().out.count("\n") == 2
+
+
+@pytest.mark.parametrize("bad", ["10:00+00:00", "10:00:30", "9:5", "25:00"])
+def test_near_misses_since_must_be_hh_mm(cfg, bad):
+    with pytest.raises(SystemExit):
+        run(cfg, "near-misses", "--since", bad)
 
 
 # ------------------------------------------------------------------- status

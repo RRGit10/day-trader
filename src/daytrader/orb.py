@@ -103,7 +103,8 @@ def evaluate_orb(
             checks.append(Check("ema", False, "insufficient data for ema"))
         else:
             ok = close > ema_v if long else close < ema_v
-            checks.append(Check("ema", ok, f"close {close:.2f} {'>' if long else '<'} ema {ema_v:.2f}"))
+            checks.append(Check("ema", ok, f"close {close:.2f} {'>' if long else '<'} "
+                                           f"ema{cfg.ema_period} {ema_v:.2f}"))
 
         vwap_v = session_vwap(today_bars)[-1]
         ok = close > vwap_v if long else close < vwap_v
@@ -114,11 +115,11 @@ def evaluate_orb(
             checks.append(Check("rsi", False, "insufficient data for rsi"))
         elif long:
             checks.append(
-                Check("rsi", rsi_v > cfg.rsi_long_min, f"rsi {rsi_v:.1f} > {cfg.rsi_long_min:.1f}")
+                Check("rsi", rsi_v > cfg.rsi_long_min, f"rsi {rsi_v:.1f} > {cfg.rsi_long_min:g}")
             )
         else:
             checks.append(
-                Check("rsi", rsi_v < cfg.rsi_short_max, f"rsi {rsi_v:.1f} < {cfg.rsi_short_max:.1f}")
+                Check("rsi", rsi_v < cfg.rsi_short_max, f"rsi {rsi_v:.1f} < {cfg.rsi_short_max:g}")
             )
 
     triggered = all(c.passed for c in checks)

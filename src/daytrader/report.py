@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 
 from .journal import Journal
-from .models import ET
+from .models import ET, Check, Direction
 
 _CAVEATS = (
     "Past results don't predict future results.",
@@ -124,3 +125,28 @@ def format_summary(s: Summary, source: str) -> str:
     if source == "backtest":
         lines += ["", *_CAVEATS]
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class NearMiss:
+    ts: datetime
+    ticker: str
+    direction: Direction
+    checks: tuple[Check, ...]
+
+
+def near_miss_changes(
+    rows: Iterable[tuple[datetime, str, bool, Direction | None, tuple[Check, ...]]],
+) -> list[NearMiss]:
+    """Checks where the breakout passed but another rule failed, kept only when that ticker's
+    set of failed rules differs from its previous check (so a repeat each bar is dropped)."""
+    last: dict[str, frozenset[str] | None] = {}
+    out: list[NearMiss] = []
+    for ts, ticker, triggered, direction, checks in rows:
+        breakout = any(c.name == "breakout" and c.passed for c in checks)
+        failed = frozenset(c.name for c in checks if not c.passed)
+        state = failed if breakout and not triggered and direction and failed else None
+        if state is not None and state != last.get(ticker):
+            out.append(NearMiss(ts, ticker, direction, checks))
+        last[ticker] = state
+    return out

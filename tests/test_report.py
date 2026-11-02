@@ -2,7 +2,7 @@ from datetime import date, datetime
 
 from daytrader.journal import Journal
 from daytrader.models import ET, Check, OrbResult, Position
-from daytrader.report import Summary, format_summary, summarize
+from daytrader.report import Summary, format_summary, near_miss_changes, summarize
 
 CAVEAT1 = "Past results don't predict future results."
 CAVEAT2 = (
@@ -102,3 +102,28 @@ def test_format_blocked_sorted_by_count():
     out = format_summary(s, "live")
     assert out.index("vwap") < out.index("ema")
     assert out.index("spread") < out.index("oi")
+
+
+def _row(minute, ticker, triggered=False, direction="long", breakout=True, **filters):
+    checks = (Check("range", True, ""), Check("window", True, ""),
+              Check("breakout", breakout, "")) + tuple(
+        Check(n, filters.get(n, True), "") for n in ("ema", "vwap", "rsi"))
+    ts = datetime(2026, 11, 2, 10, minute, tzinfo=ET)
+    return (ts, ticker, triggered, direction if breakout else None, checks)
+
+
+def test_near_miss_changes_only_when_failed_rules_change():
+    rows = [
+        _row(0, "IWM", ema=False),                 # first near-miss -> shown
+        _row(5, "IWM", ema=False),                 # same failures -> hidden
+        _row(5, "SOFI", direction="short", rsi=False),  # other ticker -> shown
+        _row(10, "IWM", ema=False, rsi=False),     # failures changed -> shown
+        _row(15, "IWM", triggered=True),           # signal fired, not a near-miss
+        _row(20, "IWM", ema=False, rsi=False),     # near-miss again after a change -> shown
+        _row(25, "IWM", breakout=False, ema=False),  # no breakout: not a near-miss
+        _row(30, "IWM", ema=False, rsi=False),     # back again -> shown
+    ]
+    got = [(m.ts.minute, m.ticker, m.direction) for m in near_miss_changes(rows)]
+    assert got == [(0, "IWM", "long"), (5, "SOFI", "short"), (10, "IWM", "long"),
+                   (20, "IWM", "long"), (30, "IWM", "long")]
+    assert near_miss_changes(rows)[0].checks == rows[0][4]
