@@ -326,6 +326,7 @@
   - `scan` — affordability filter + current `evaluate_orb` per ticker, printed as a table (ticker, eligible/reason, each check ✓/✗).
   - `approve ID` / `reject ID` — `write_decision`; exit code 1 + message if unknown.
   - `pending` — prints pending tickets' `summary()`, then an indented `rules:` line from `rules_line(strategy)` with ✓/✗ for ORB breakout, 2-candle rule, EMA, VWAP and RSI (used by the skill).
+  - `near-misses [--mode approval|bot] [--after HH:MM]` — today's checks where the breakout passed but a filter failed, one line per ticker each time its set of failed rules changes, with the same `rules:` badges (used by the skill; information only).
   - `status [--mode bot]` — heartbeat age (flag "STALE" if > 60 s during market hours), open position, today's P&L and guard state.
   - `report --journal {bot,approval,backtest} [--start] [--end]`.
   - `backtest [--start YYYY-MM-DD] [--end] [--tickers A,B]` — default last 12 months, never before 2024-02-01 (earlier start → clamp with a message); journal `state/journal-backtest.db` (recreated each run); prints `format_summary`.
