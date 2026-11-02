@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
@@ -193,3 +194,42 @@ class Journal:
     def skip_rows(self) -> list[tuple[datetime, str, str]]:
         rows = self._conn.execute("SELECT ts, ticker, reason FROM skips ORDER BY id").fetchall()
         return [(_parse(r[0]), r[1], r[2]) for r in rows]
+
+    def skips_on(self, day: date) -> list[tuple[datetime, str, str, str]]:
+        rows = self._conn.execute(
+            "SELECT ts, ticker, reason, detail FROM skips ORDER BY id").fetchall()
+        return [(_parse(r[0]), r[1], r[2], r[3]) for r in rows if _parse(r[0]).date() == day]
+
+    def tickets_on(self, day: date) -> list[tuple[datetime, dict, str]]:
+        rows = self._conn.execute("SELECT ts, payload, status FROM tickets ORDER BY ts").fetchall()
+        return [(_parse(r[0]), json.loads(r[1]), r[2]) for r in rows if _parse(r[0]).date() == day]
+
+    def trade_records_on(self, day: date) -> list[TradeRecord]:
+        """Trades opened or closed on `day` (an overnight hold shows on both days)."""
+        rows = self._conn.execute(
+            "SELECT ticker, direction, option_symbol, qty, entry_price, entry_stock_price,"
+            " opened_at, exit_price, pnl, reason, closed_at FROM trades ORDER BY id"
+        ).fetchall()
+        records = [
+            TradeRecord(r[0], r[1], r[2], r[3], r[4], r[5], _parse(r[6]), r[7], r[8], r[9],
+                        _parse(r[10]) if r[10] else None)
+            for r in rows
+        ]
+        return [t for t in records
+                if t.opened_at.date() == day or (t.closed_at and t.closed_at.date() == day)]
+
+
+@dataclass(frozen=True)
+class TradeRecord:
+    """A journaled trade; the exit fields are None while it is still open."""
+    ticker: str
+    direction: Direction
+    option_symbol: str
+    qty: int
+    entry_price: float
+    entry_stock_price: float
+    opened_at: datetime
+    exit_price: float | None
+    pnl: float | None
+    reason: str | None
+    closed_at: datetime | None

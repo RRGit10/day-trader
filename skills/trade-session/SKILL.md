@@ -31,6 +31,10 @@ The engine stops if the Claude Code session closes: a background process started
 7. After approval, tell the user the engine re-quotes and may re-ask if the price moved more than 5%; exits then run automatically.
 8. After 11:30 ET (or once the guard has blocked entries), check `daytrader status --mode approval` every ~5 minutes until the open position is closed (`open position: none`); the engine flattens at 15:55 ET at the latest.
 9. At the end of the session run `daytrader report --journal approval --start <today as YYYY-MM-DD>` and explain it in plain English.
+10. Then journal the day. Get the file's path with `daytrader day-log --mode approval --path` (pass the same `--config` as the rest of the session, if any); it is inside that config's state folder. Run `daytrader day-log --mode approval`; if it exits non-zero, show its message, leave any existing journal file untouched, and stop this step. Otherwise write the file (create its folder if needed), starting with the command's output exactly as printed; never retype or change its numbers. Then add two sections, headed with the time this session started:
+    - `## Your decisions (session from HH:MM ET)`: for each ticket in this session, what the user said and when (approve, reject, or no answer before it expired), and what followed, from this conversation.
+    - `## Review (session from HH:MM ET)`: a few plain-English sentences per trade and for the session — which exit fired and how fast, tickets missed or not filled and why, which rules blocked the near-misses most. Stick to what the journal shows; no predictions and no advice on what to trade.
+    If the file already exists (an earlier session that day), keep everything from its first `## Your decisions` heading onward: replace only the generated part above that heading with the new `day-log` output, then append this session's two sections at the end. Never edit or drop an earlier session's sections. Tell the user the file's path.
 
 ## Rules
 

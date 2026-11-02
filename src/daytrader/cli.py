@@ -18,6 +18,7 @@ from .clock import STARTUP_RETRY_EVERY, SystemClock, retry_until, startup_deadli
 from .config import ConfigError, Keys, Settings, load_settings
 from .contracts import pick_contract
 from .data import AlpacaData
+from .daylog import format_day_log
 from .guard import may_enter
 from .history import AlpacaHistorical
 from .journal import Journal
@@ -329,6 +330,23 @@ def _cmd_status(args, settings: Settings, deps: Deps) -> int:
     return 0
 
 
+def _cmd_day_log(args, settings: Settings, deps: Deps) -> int:
+    day = args.date or deps.now().astimezone(ET).date()
+    if args.path:
+        print(settings.state_dir / "trade-journal" / f"{day.isoformat()}-{args.mode}.md")
+        return 0
+    path = _journal_path(settings, args.mode)
+    if not path.is_file():
+        print(f"no journal at {path}")
+        return 1
+    journal = Journal(path)
+    try:
+        print(format_day_log(journal, day, args.mode, settings.strategy.entry_start), end="")
+    finally:
+        journal.close()
+    return 0
+
+
 def _cmd_report(args, settings: Settings) -> int:
     path = _journal_path(settings, args.journal)
     if not path.is_file():
@@ -479,6 +497,11 @@ def _parser() -> argparse.ArgumentParser:
     s = sub.add_parser("near-misses", help="today's breakouts blocked by another rule, on change")
     s.add_argument("--mode", choices=("approval", "bot"), default="approval")
     s.add_argument("--since", type=_hhmm, help="only those at or after this ET minute (HH:MM)")
+    s = sub.add_parser("day-log", help="one day's trades, tickets and skips as Markdown")
+    s.add_argument("--mode", choices=("approval", "bot"), default="approval")
+    s.add_argument("--date", type=_day, help="YYYY-MM-DD (default today)")
+    s.add_argument("--path", action="store_true",
+                   help="print where that day's journal file belongs, and exit")
     s = sub.add_parser("status", help="heartbeat, position, P&L, guard state")
     s.add_argument("--mode", choices=("approval", "bot"), default="bot")
     s = sub.add_parser("report", help="performance report from a journal")
@@ -513,6 +536,8 @@ def main(argv: Sequence[str] | None = None, deps: Deps | None = None) -> int:
             return _cmd_pending(args, settings, deps)
         if cmd == "near-misses":
             return _cmd_near_misses(args, settings, deps)
+        if cmd == "day-log":
+            return _cmd_day_log(args, settings, deps)
         if cmd == "status":
             return _cmd_status(args, settings, deps)
         if cmd == "report":
