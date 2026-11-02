@@ -138,7 +138,7 @@ class NearMiss:
 def near_miss_changes(
     rows: Iterable[tuple[datetime, str, bool, Direction | None, tuple[Check, ...]]],
 ) -> list[NearMiss]:
-    """Checks where the breakout passed but a filter failed, kept only when that ticker's
+    """Checks where the breakout passed but another rule failed, kept only when that ticker's
     set of failed rules differs from its previous check (so a repeat each bar is dropped)."""
     last: dict[str, frozenset[str] | None] = {}
     out: list[NearMiss] = []
