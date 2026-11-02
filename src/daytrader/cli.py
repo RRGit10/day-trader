@@ -249,6 +249,7 @@ def _cmd_pending(args, settings: Settings, deps: Deps) -> int:
             continue
         created = ticket.created_at.astimezone(ET)
         print(f"{ticket.id}  created {created:%H:%M:%S} ET  {ticket.summary()}")
+        print(f"    rules: {ticket.rules_line(settings.strategy)}")
         shown += 1
     if not shown:
         print("No pending tickets.")
