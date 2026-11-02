@@ -108,6 +108,16 @@ def test_contracts_for_budget():
 def test_entry_limit_price():
     assert entry_limit_price(2.40, 2.46) == 2.43
     assert entry_limit_price(4.10, 4.30) == 4.20
-    assert entry_limit_price(4.10, 4.33) == 4.20  # mid 4.215 -> nearest 0.05
-    assert entry_limit_price(2.40, 2.43) == 2.42  # mid 2.415 -> half-up on cent grid
+    assert entry_limit_price(4.10, 4.33) == 4.25  # mid 4.215 -> up to the next 0.05
+    assert entry_limit_price(2.40, 2.43) == 2.42  # mid 2.415 -> up on cent grid
     assert entry_limit_price(2.95, 3.04) == 3.00  # mid 2.995 -> 3.00
+
+
+def test_entry_limit_never_below_mid():
+    # 2026-11-02 INTC put: mid 3.22 was rounded down to 3.20 and never filled
+    assert entry_limit_price(3.17, 3.27) == 3.25
+
+
+def test_entry_limit_stays_on_the_tick_grid_past_an_off_grid_ask():
+    # 3.22 is not a valid price on the $0.05 grid, so the limit stays at 3.25
+    assert entry_limit_price(3.20, 3.22) == 3.25
