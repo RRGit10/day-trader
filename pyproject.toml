@@ -15,6 +15,9 @@ dev = ["pytest"]
 [project.scripts]
 daytrader = "daytrader.cli:main"
 
+[tool.setuptools.package-data]
+daytrader = ["*.html"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

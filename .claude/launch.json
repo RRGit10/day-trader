@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "calendar",
+      "runtimeExecutable": "daytrader",
+      "runtimeArgs": ["calendar"],
+      "port": 8765
+    }
+  ]
+}
