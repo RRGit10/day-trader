@@ -14,6 +14,7 @@ from typing import Callable, Sequence
 from .approval import AutoApprover, FileApprover, Ticket, rules_line, write_decision
 from .backtest import run_backtest
 from .broker import PaperLockError, make_broker
+from .calendar_server import make_server
 from .clock import STARTUP_RETRY_EVERY, SystemClock, retry_until, startup_deadline
 from .config import ConfigError, Keys, Settings, load_settings
 from .contracts import pick_contract
@@ -347,6 +348,20 @@ def _cmd_day_log(args, settings: Settings, deps: Deps) -> int:
     return 0
 
 
+def _cmd_calendar(args, settings: Settings, deps: Deps) -> int:
+    try:
+        server = make_server(settings.state_dir, args.port, deps.now)
+    except OSError:
+        print(f"error: port {args.port} is in use; try --port N")
+        return 1
+    print(f"calendar: http://127.0.0.1:{args.port}  (Ctrl-C to stop)", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
+
+
 def _cmd_report(args, settings: Settings) -> int:
     path = _journal_path(settings, args.journal)
     if not path.is_file():
@@ -508,6 +523,8 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--journal", choices=("bot", "approval", "backtest"), required=True)
     s.add_argument("--start", type=_day)
     s.add_argument("--end", type=_day)
+    s = sub.add_parser("calendar", help="browser P&L calendar on 127.0.0.1")
+    s.add_argument("--port", type=int, default=8765, help="port to serve on (default 8765)")
     s = sub.add_parser("backtest", help="replay history (default: last 12 months)")
     s.add_argument("--start", type=_day)
     s.add_argument("--end", type=_day)
@@ -542,6 +559,8 @@ def main(argv: Sequence[str] | None = None, deps: Deps | None = None) -> int:
             return _cmd_status(args, settings, deps)
         if cmd == "report":
             return _cmd_report(args, settings)
+        if cmd == "calendar":
+            return _cmd_calendar(args, settings, deps)
         if cmd == "backtest":
             return _cmd_backtest(args, settings, deps)
         if cmd == "doctor":

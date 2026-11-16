@@ -608,3 +608,20 @@ def test_scan_prints_table(cfg, keys, capsys):
     assert run(cfg, "scan", deps=cli.Deps(data=lambda k: data, now=lambda: NOW)) == 0
     out = capsys.readouterr().out
     assert "SPY" in out and "AAPL" in out and "✗" in out
+
+
+def test_calendar_parser_default_port():
+    args = cli._parser().parse_args(["calendar"])
+    assert (args.command, args.port) == ("calendar", 8765)
+    assert cli._parser().parse_args(["calendar", "--port", "9001"]).port == 9001
+
+
+def test_calendar_port_in_use(cfg, capsys):
+    import socket
+    with socket.socket() as held:
+        held.bind(("127.0.0.1", 0))
+        held.listen()
+        port = held.getsockname()[1]
+        assert run(cfg, "calendar", "--port", str(port)) == 1
+    out = capsys.readouterr().out
+    assert out.strip() == f"error: port {port} is in use; try --port N"
