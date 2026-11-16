@@ -11,6 +11,7 @@
     --win: #1e8e4e; --loss: #b8322b; --text: #f2f2f2; --muted: #9a9a9a; --dim: #6a6a6a;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 15px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   .wrap { max-width: 1080px; margin: 0 auto; padding: 16px; }
@@ -22,11 +23,11 @@
   .seg button.on { background: #333; color: var(--text); }
   .nav { display: inline-flex; align-items: center; background: var(--bar); border-radius: 6px; }
   .nav span { min-width: 90px; text-align: center; font-size: 17px; }
-  .dow, .grid { display: grid; grid-template-columns: repeat(7, 1fr); }
+  .dow, .grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
   .dow { background: var(--bar); border-radius: 4px; margin-bottom: 8px; }
   .dow div { text-align: center; padding: 12px 0; color: var(--muted); }
   .grid { gap: 2px; background: var(--line); border-radius: 8px; overflow: hidden; }
-  .grid.year { grid-template-columns: repeat(4, 1fr); }
+  .grid.year { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .cell { background: var(--past); min-height: 84px; padding: 12px 4px; text-align: center;
           display: flex; flex-direction: column; justify-content: center; gap: 8px;
           cursor: pointer; border: 2px solid transparent; }
@@ -47,6 +48,26 @@
   th, td { text-align: left; padding: 6px 8px; border-top: 1px solid #222; }
   th { color: var(--muted); font-weight: 400; border-top: 0; }
   .foot { margin-top: 10px; color: var(--dim); font-size: 12px; }
+  @media (max-width: 760px) {
+    .wrap { padding: 10px 8px; }
+    header { gap: 8px; }
+    h1 { font-size: 19px; flex-basis: 100%; }
+    .seg button, .nav button { padding: 6px 10px; }
+    .nav span { min-width: 72px; font-size: 15px; }
+    .dow div { padding: 8px 0; font-size: 12px; }
+    .cell { min-height: 66px; padding: 8px 1px; gap: 4px; }
+    .cell .n { font-size: 13px; }
+    .cell .v { font-size: 11.5px; }
+    .grid.year { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .summary { gap: 6px 16px; font-size: 13px; }
+    th, td { padding: 5px 4px; font-size: 12px; }
+  }
+  @media (max-width: 480px) {
+    .grid { gap: 1px; }
+    .cell { min-height: 56px; padding: 6px 0; }
+    .cell .v { font-size: 9.5px; letter-spacing: -0.2px; }
+    .dow div { font-size: 11px; }
+  }
   .err { background: #3a1412; color: #ffb3ad; padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; }
 </style>
 </head>
@@ -88,11 +109,14 @@ function el(tag, cls, text) {
   return e;
 }
 
+let loadSeq = 0;
 async function load() {
+  const seq = ++loadSeq;  // a slower, older response must not overwrite a newer one
   try {
     const r = await fetch(`/api/days?journal=${S.journal}`, { cache: "no-store" });
     if (!r.ok) throw new Error(await r.text());
     const data = await r.json();
+    if (seq !== loadSeq) return;
     S.today = data.today;
     S.days = new Map(data.days.map((d) => [d.date, d]));
     if (S.year === null) {
@@ -103,6 +127,7 @@ async function load() {
     $("foot").textContent = `Updated ${new Date().toLocaleTimeString()} · refreshes every 30 s · ` +
       "a trade counts on the day it closed (ET); % = P&L ÷ money put into those trades";
   } catch (e) {
+    if (seq !== loadSeq) return;
     $("err").hidden = false;
     $("err").textContent = `Can't load the ${S.journal} journal: ${e.message || e}. Is \`daytrader calendar\` still running?`;
   }
