@@ -114,7 +114,7 @@ async function load() {
   const seq = ++loadSeq;  // a slower, older response must not overwrite a newer one
   try {
     const r = await fetch(`/api/days?journal=${S.journal}`, { cache: "no-store" });
-    if (!r.ok) throw new Error(await r.text());
+    if (!r.ok) throw Object.assign(new Error(await r.text()), { fromServer: true });
     const data = await r.json();
     if (seq !== loadSeq) return;
     S.today = data.today;
@@ -129,7 +129,8 @@ async function load() {
   } catch (e) {
     if (seq !== loadSeq) return;
     $("err").hidden = false;
-    $("err").textContent = `Can't load the ${S.journal} journal: ${e.message || e}. Is \`daytrader calendar\` still running?`;
+    $("err").textContent = e.fromServer ? `Can't load the ${S.journal} journal: ${e.message}`
+      : `Can't reach the calendar server (${e.message || e}). Is \`daytrader calendar\` still running?`;
   }
   render();
 }
@@ -257,7 +258,10 @@ function step(dir) {
 
 $("prev").onclick = () => step(-1);
 $("next").onclick = () => step(1);
-for (const b of $("journal").children) b.onclick = () => { S.journal = b.dataset.j; S.selected = null; load(); };
+for (const b of $("journal").children) b.onclick = () => {
+  // drop the old journal's days so a failed load can't show them under the new label
+  S.journal = b.dataset.j; S.selected = null; S.days = new Map(); render(); load();
+};
 for (const b of $("view").children) b.onclick = () => { S.view = b.dataset.v; render(); };
 render();
 load();

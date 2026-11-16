@@ -1,7 +1,10 @@
 """Local web server for the P&L calendar: the page plus a read-only JSON endpoint."""
 from __future__ import annotations
 
+import errno
 import json
+import socket
+import sqlite3
 from collections.abc import Callable
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,9 +18,24 @@ from .pnl_calendar import JOURNALS, days_payload, load_days
 HOST = "127.0.0.1"
 
 
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+
+def _port_answers(port: int) -> bool:
+    """True if something already accepts connections on 127.0.0.1:port (even via 0.0.0.0)."""
+    try:
+        socket.create_connection((HOST, port), timeout=0.3).close()
+        return True
+    except OSError:
+        return False
+
+
 def make_server(state_dir: Path, port: int, now: Callable[[], datetime]) -> ThreadingHTTPServer:
     """Bind the calendar server on 127.0.0.1:port (OSError if the port is taken)."""
     state_dir = Path(state_dir)
+    if port and _port_answers(port):
+        raise OSError(errno.EADDRINUSE, f"port {port} is in use")
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status: int, ctype: str, body: bytes) -> None:
@@ -42,7 +60,11 @@ def make_server(state_dir: Path, port: int, now: Callable[[], datetime]) -> Thre
                 if name not in JOURNALS:
                     self._text(400, f"journal must be one of {', '.join(JOURNALS)}")
                     return
-                days = load_days(state_dir / f"journal-{name}.db")
+                try:
+                    days = load_days(state_dir / f"journal-{name}.db")
+                except sqlite3.Error as exc:  # locked, damaged or not a journal
+                    self._text(503, f"{name} journal unreadable: {exc}")
+                    return
                 body = json.dumps(days_payload(days, now().astimezone(ET).date()))
                 self._send(200, "application/json", body.encode())
                 return
@@ -51,4 +73,4 @@ def make_server(state_dir: Path, port: int, now: Callable[[], datetime]) -> Thre
         def log_message(self, format: str, *args) -> None:  # keep the terminal quiet
             pass
 
-    return ThreadingHTTPServer((HOST, port), Handler)
+    return _Server((HOST, port), Handler)

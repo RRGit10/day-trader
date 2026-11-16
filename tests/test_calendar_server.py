@@ -80,3 +80,20 @@ def test_unknown_path_404(served):
 def test_binds_localhost_only(served):
     server, _, _ = served
     assert server.server_address[0] == "127.0.0.1"
+
+
+def test_unreadable_journal_503(served):
+    _, base, state = served
+    (state / "journal-bot.db").write_bytes(b"")  # empty file: no trades table
+    assert status_of(base + "/api/days?journal=bot") == 503
+    status, _, _ = get(base + "/api/days?journal=approval")  # server still answers
+    assert status == 200
+
+
+def test_port_held_on_all_interfaces_is_in_use(tmp_path):
+    import socket
+    with socket.socket() as held:
+        held.bind(("0.0.0.0", 0))
+        held.listen()
+        with pytest.raises(OSError):
+            make_server(tmp_path, held.getsockname()[1], lambda: NOW)
